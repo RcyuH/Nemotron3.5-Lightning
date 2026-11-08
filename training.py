@@ -94,12 +94,16 @@ def build_config(args: argparse.Namespace) -> ConfigContainer:
             path_or_dataset="json",
             split="train",
             load_kwargs={"data_files": str(Path(args.dataset_root) / "training.jsonl")},
+            skip_invalid_jsonl_rows=True,
+            skip_multimodal_rows=True,
         ),
         validation_source=(
             HFDatasetSourceConfig(
                 path_or_dataset="json",
                 split="train",
                 load_kwargs={"data_files": str(Path(args.dataset_root) / "validation.jsonl")},
+                skip_invalid_jsonl_rows=True,
+                skip_multimodal_rows=True,
             )
             if args.do_validation
             else None
