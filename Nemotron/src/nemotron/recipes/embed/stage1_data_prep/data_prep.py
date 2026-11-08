@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+# /// script
+# [tool.runspec]
+# schema = "1"
+# docs = "https://raw.githubusercontent.com/NVIDIA-NeMo/Nemotron/main/docs/runspec/v1/spec.md"
+# name = "embed/prep"
+# image = "nvcr.io/nvidia/pytorch:25.12-py3"
+# setup = "PyTorch pre-installed. Stage dependencies resolved via UV at runtime."
+#
+# [tool.runspec.run]
+# launch = "direct"
+#
+# [tool.runspec.config]
+# dir = "./config"
+# default = "default"
+#
+# [tool.runspec.resources]
+# nodes = 1
+# gpus_per_node = 1
+# ///
+
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Data Preparation for embedding fine-tuning.
+
+Prepares training data from SDG output:
+1. Convert to BEIR format (train/val/test split)
+2. Mine hard negatives using base embedding model
+3. Unroll multi-hop positives
+
+Usage:
+    # With default config
+    nemotron embed prep -c default
+
+    # With custom config
+    nemotron embed prep -c /path/to/config.yaml
+
+    # With CLI overrides
+    nemotron embed prep -c default sdg_input_path=/path/to/sdg
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import subprocess
+import sys
+from pathlib import Path
+from typing import TYPE_CHECKING, Literal
+
+from pydantic import ConfigDict, Field, model_validator
+
+from nemo_runspec.config.pydantic_loader import RecipeSettings, load_config, parse_config_and_overrides
+
+if TYPE_CHECKING:
+    from data_designer_retrieval_sdg import ConversionResult
+
+STAGE_PATH = Path(__file__).parent
+DEFAULT_CONFIG_PATH = STAGE_PATH / "config" / "default.yaml"
+
+# Use NEMO_RUN_DIR for output when running via nemo-run
+_OUTPUT_BASE = Path(os.environ.get("NEMO_RUN_DIR", "."))
+
+
+class DataPrepConfig(RecipeSettings):
+    """Data Preparation configuration.
+
+    Converts SDG output to training format, mines hard negatives,
+    and unrolls multi-hop positives.
+    """
+
+    model_config = ConfigDict(extra="forbid")
+
+    artifact_root: Path = Field(
+        default_factory=lambda: _OUTPUT_BASE / "output/embed/nemotron-3-1b",
+        description="Root directory for this model profile's pipeline artifacts.",
+    )
+
+    corpus_id: str = Field(default="nv_pp_random", description="Corpus identifier (used for output naming).")
+    sdg_input_path: Path | None = Field(
+        default_factory=lambda data: data["artifact_root"] / "stage0_sdg/generation_result.json",
+        description="Stage 0 generation-result manifest, exact SDG output file, or explicit legacy input path.",
+    )
+    train_input_file: Path | None = Field(
+        default=None, description="Path to pre-converted training file (skips SDG conversion)."
+    )
+    output_dir: Path = Field(
+        default_factory=lambda data: data["artifact_root"] / "stage1_data_prep",
+        description="Output directory for prepared training data.",
+    )
+    artifact_recipe: Literal["embed", "rerank"] = Field(
+        default="embed",
+        description="Recipe namespace for the saved data artifact.",
+    )
+
+    # Model for hard negative mining
+    base_model: str = Field(
+        default="nvidia/Nemotron-3-Embed-1B-BF16", description="Base embedding model for hard negative mining."
+    )
+    trust_remote_code: bool = Field(
+        default=True,
+        description="Allow Hugging Face custom model code while loading the embedding model.",
+    )
+
+    # Quality filtering
+    quality_threshold: float = Field(
+        default=7.0, ge=0, le=10, description="Minimum quality score for Q&A pairs (0-10 scale)."
+    )
+
+    # Train/val/test split ratios
+    train_ratio: float = Field(default=0.8, gt=0, lt=1, description="Fraction of data for training.")
+    val_ratio: float = Field(default=0.0, ge=0, lt=1, description="Fraction of data for validation.")
+    test_ratio: float = Field(default=0.2, ge=0, lt=1, description="Fraction of data for testing.")
+    conversion_seed: int = Field(default=42, description="Random seed for deterministic conversion splits.")
+    max_pos_docs: int = Field(default=5, gt=0, description="Maximum positive documents per query.")
+    use_group_id_in_eval: bool = Field(default=False, description="Use stable group IDs in BEIR evaluation qrels.")
+    split_strategy: Literal["random", "dedupped", "cluster"] = Field(
+        default="random",
+        description="Conversion split strategy.",
+    )
+    groups_json: list[Path] | None = Field(
+        default=None,
+        description="Optional deduplication-group files used by dedupped or cluster splitting.",
+    )
+
+    @model_validator(mode="after")
+    def _check_ratios_sum_to_one(self):
+        total = self.train_ratio + self.val_ratio + self.test_ratio
+        if abs(total - 1.0) > 1e-6:
+            raise ValueError(f"train_ratio + val_ratio + test_ratio must equal 1.0, got {total}")
+        if self.split_strategy != "random" and not self.groups_json:
+            raise ValueError(f"groups_json is required when split_strategy={self.split_strategy}")
+        return self
+
+    # Hard negative mining settings
+    attn_implementation: Literal["sdpa", "flash_attention_2", "eager"] = Field(
+        default="sdpa", description="Attention implementation (sdpa, flash_attention_2, eager)."
+    )
+    hard_negatives_to_mine: int = Field(default=5, gt=0, description="Number of hard negatives to mine per query.")
+    hard_neg_margin: float = Field(default=0.95, gt=0, le=1, description="Margin for hard negative selection.")
+    mining_batch_size: int = Field(default=128, gt=0, description="Batch size for mining.")
+    query_max_length: int = Field(default=512, gt=0, description="Maximum query length for tokenization.")
+    passage_max_length: int = Field(default=512, gt=0, description="Maximum passage length for tokenization.")
+    query_prefix: str = Field(default="query: ", description="Prefix for query inputs during mining.")
+    passage_prefix: str = Field(default="passage: ", description="Prefix for passage inputs during mining.")
+
+    @model_validator(mode="after")
+    def _check_input_source(self):
+        if self.sdg_input_path and self.train_input_file:
+            raise ValueError(
+                "sdg_input_path and train_input_file are mutually exclusive. "
+                "Set sdg_input_path to convert from SDG output, or "
+                "train_input_file to use a pre-converted training file."
+            )
+        if not self.sdg_input_path and not self.train_input_file:
+            raise ValueError("One of sdg_input_path or train_input_file must be set.")
+        return self
+
+
+def run_convert(cfg: DataPrepConfig) -> ConversionResult:
+    """Convert SDG output to training format.
+
+    Returns:
+        Plugin result containing generated paths and counts.
+    """
+    from nemotron.recipes.embed.stage1_data_prep.plugin_adapter import execute_conversion
+
+    print("Converting SDG output to training format...")
+    return execute_conversion(cfg)
+
+
+def run_mining(cfg: DataPrepConfig, train_file: Path) -> Path:
+    """Mine hard negatives using base embedding model.
+
+    Returns:
+        Path to mined training file.
+    """
+    mining_script = STAGE_PATH / "scripts" / "mine_hard_negatives.py"
+    mining_config = STAGE_PATH / "scripts" / "mining_config.yaml"
+    output_file = cfg.output_dir / "train_mined.automodel.json"
+    cache_dir = cfg.output_dir / "cache_embeddings"
+
+    cmd = [
+        sys.executable,
+        "-m",
+        "torch.distributed.run",
+        "--nproc_per_node",
+        "gpu",
+        str(mining_script),
+        "--config",
+        str(mining_config),
+        "--mining.model_name_or_path",
+        cfg.base_model,
+        "--mining.train_qa_file_path",
+        str(train_file),
+        "--mining.train_file_output_path",
+        str(output_file),
+        "--mining.cache_embeddings_dir",
+        str(cache_dir),
+        "--mining.hard_neg_margin",
+        str(cfg.hard_neg_margin),
+        "--mining.hard_negatives_to_mine",
+        str(cfg.hard_negatives_to_mine),
+        "--mining.mining_batch_size",
+        str(cfg.mining_batch_size),
+        "--mining.query_prefix",
+        cfg.query_prefix,
+        "--mining.passage_prefix",
+        cfg.passage_prefix,
+        "--mining.query_max_length",
+        str(cfg.query_max_length),
+        "--mining.passage_max_length",
+        str(cfg.passage_max_length),
+        "--mining.attn_implementation",
+        cfg.attn_implementation,
+        "--mining.trust_remote_code",
+        str(cfg.trust_remote_code).lower(),
+        "--mining.add_bos_token",
+        "true",
+        "--mining.add_eos_token",
+        "false",
+    ]
+
+    print("\n⛏️  Mining hard negatives...")
+    print(f"   Using model: {cfg.base_model}")
+
+    result = subprocess.run(cmd, stdout=None, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print(f"Error: mining script failed with return code {result.returncode}")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(result.returncode)
+
+    return output_file
+
+
+def run_unroll(cfg: DataPrepConfig) -> Path:
+    """Unroll multi-hop positives.
+
+    Returns:
+        Path to final training file.
+    """
+    unroll_script = STAGE_PATH / "scripts" / "unroll_pos_docs.py"
+
+    mined_file = cfg.output_dir / "train_mined.automodel.json"
+
+    cmd = [
+        sys.executable,
+        str(unroll_script),
+        str(mined_file),
+    ]
+
+    print("\n🔄 Unrolling multi-positive training examples...")
+
+    result = subprocess.run(cmd, stdout=None, stderr=subprocess.PIPE, text=True)
+
+    if result.returncode != 0:
+        print(f"Error: unroll script failed with return code {result.returncode}")
+        if result.stderr:
+            print(result.stderr, file=sys.stderr)
+        sys.exit(result.returncode)
+
+    return cfg.output_dir / "train_mined.automodel_unrolled.json"
+
+
+def run_data_prep(cfg: DataPrepConfig) -> Path:
+    """Run full data preparation pipeline.
+
+    Args:
+        cfg: Data prep configuration.
+
+    Returns:
+        Path to final training data file.
+    """
+    configured_sdg_input = cfg.sdg_input_path
+    if configured_sdg_input:
+        from nemotron.recipes.embed.sdg_manifest import resolve_generation_input
+
+        try:
+            resolved_sdg_input = resolve_generation_input(configured_sdg_input)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            print(
+                "       Please run stage0_sdg first, or provide an explicit sdg_input_path.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        cfg = cfg.model_copy(update={"sdg_input_path": resolved_sdg_input})
+
+    print("📋 Data Preparation Pipeline")
+    print("=" * 60)
+    print(f"Corpus ID:      {cfg.corpus_id}")
+    if cfg.sdg_input_path:
+        if configured_sdg_input != cfg.sdg_input_path:
+            print(f"SDG Handoff:    {configured_sdg_input}")
+        print(f"SDG Input:      {cfg.sdg_input_path}")
+    else:
+        print(f"Train Input:    {cfg.train_input_file}")
+    print(f"Output Dir:     {cfg.output_dir}")
+    print(f"Base Model:     {cfg.base_model}")
+    print("=" * 60)
+    print()
+
+    # Step 1: Convert SDG output, or use pre-converted training file
+    if cfg.train_input_file:
+        if not cfg.train_input_file.exists():
+            print(f"Error: train_input_file not found: {cfg.train_input_file}", file=sys.stderr)
+            sys.exit(1)
+        train_file = cfg.train_input_file
+        print(f"⏭️  Skipping conversion (using train_input_file: {train_file})")
+    else:
+        if not cfg.sdg_input_path.exists():
+            print(f"Error: SDG input path not found: {cfg.sdg_input_path}", file=sys.stderr)
+            print("       Please run stage0_sdg first, or provide train_input_file.", file=sys.stderr)
+            sys.exit(1)
+        conversion_result = run_convert(cfg)
+        if conversion_result.train_file is None:
+            raise RuntimeError("Retrieval SDG conversion did not produce a training file")
+        train_file = conversion_result.train_file
+
+    # Step 2: Mine hard negatives
+    run_mining(cfg, train_file)
+
+    # Step 3: Unroll
+    final_file = run_unroll(cfg)
+
+    # Check eval set size (defaults for artifact metadata)
+    eval_query_count = 0
+    train_count = 0
+    eval_queries_path = cfg.output_dir / "eval_beir" / "queries.jsonl"
+    if eval_queries_path.exists():
+        with open(eval_queries_path) as f:
+            eval_query_count = sum(1 for _ in f)
+        if eval_query_count < 50:
+            print(f"\nWarning: Eval set has only {eval_query_count} queries (recommended: 50+).", file=sys.stderr)
+            print("         Small eval sets produce noisy metrics. Consider:", file=sys.stderr)
+            print("         - Adding more documents to your corpus", file=sys.stderr)
+            print("         - Increasing num_pairs in SDG config", file=sys.stderr)
+            print(f"         - Increasing test_ratio (currently {cfg.test_ratio})", file=sys.stderr)
+        else:
+            print(f"\n   Eval queries: {eval_query_count}")
+
+    # Check training set size
+    if final_file.exists():
+        with open(final_file) as f:
+            train_data = json.load(f)
+        train_count = len(train_data.get("data", []))
+        print(f"   Training examples: {train_count}")
+        if train_count < 100:
+            print(f"\nWarning: Only {train_count} training examples.", file=sys.stderr)
+            print("         Consider adding more documents or increasing num_pairs in SDG config.", file=sys.stderr)
+
+    print("\nData preparation complete!")
+    print(f"   Training data: {final_file}")
+    print(f"   Eval data:     {cfg.output_dir / 'eval_beir'}")
+
+    # Save artifact (registers with artifact registry if kit.init() was called)
+    try:
+        if cfg.artifact_recipe == "rerank":
+            from nemotron.kit.artifacts.rerank import RerankDataArtifact as DataArtifact
+
+            artifact_name = "rerank/data"
+        else:
+            from nemotron.kit.artifacts.embed import EmbedDataArtifact as DataArtifact
+
+            artifact_name = "embed/data"
+
+        artifact = DataArtifact(
+            path=cfg.output_dir,
+            training_examples=train_count,
+            eval_queries=eval_query_count,
+            base_model=cfg.base_model,
+            quality_threshold=cfg.quality_threshold,
+            hard_negatives_per_query=cfg.hard_negatives_to_mine,
+        )
+        artifact.save(name=artifact_name)
+    except Exception:
+        pass  # Artifact save is best-effort — don't break the pipeline
+
+    return final_file
+
+
+def main(cfg: DataPrepConfig | None = None) -> Path:
+    """Entry point for data preparation.
+
+    Args:
+        cfg: Config from CLI framework, or None when run directly as script.
+
+    Returns:
+        Path to final training data file.
+    """
+    if cfg is None:
+        # Called directly as script - parse config ourselves
+        config_path, cli_overrides = parse_config_and_overrides(default_config=DEFAULT_CONFIG_PATH)
+
+        try:
+            cfg = load_config(config_path, cli_overrides, DataPrepConfig)
+        except FileNotFoundError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+    return run_data_prep(cfg)
+
+
+if __name__ == "__main__":
+    main()

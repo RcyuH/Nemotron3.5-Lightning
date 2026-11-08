@@ -1,0 +1,139 @@
+# Nemotron 3.5 Lightning CPT phase 1: 200B tokens at 8K.
+#
+# Required environment variables:
+#   CPT_DATA_BLEND       Absolute path to the final per-split blend.json.
+#   CPT_DATA_CACHE       Shared directory for Megatron dataset index caches.
+#   CPT_HF_MODEL_DIR     Local HF snapshot containing config/tokenizer files.
+#   CPT_BASE_CHECKPOINT  Native Megatron checkpoint (recommended) or a local
+#                        Hugging Face snapshot directory for the Base model.
+#   CPT_RUN_ROOT         Shared output directory for checkpoints and logs.
+#
+# Token accounting:
+#   8,192 tokens/sample * GBS 512 = 4,194,304 tokens/optimizer step.
+#   47,684 steps = 200,001,191,936 token slots.
+
+run:
+  env:
+    # The direct torchrun launcher determines the actual allocation. One local
+    # 8-GPU server is the default; use NNODES/NODE_RANK for multiple servers.
+    nodes: 1
+    gpus_per_node: 8
+    ntasks_per_node: 8
+
+recipe:
+  _target_: megatron.bridge.recipes.nemotronh.nemotron_3_5_lightning_pretrain_config
+  per_split_data_args_path: ${oc.env:CPT_DATA_BLEND}
+
+# Keep both the model provider and tokenizer on the Base checkpoint. The
+# upstream Lightning recipe otherwise points at the post-trained checkpoint.
+model:
+  # A local path prevents AutoBridge/checkpoint helpers from resolving the Hub.
+  hf_model_id: ${oc.env:CPT_HF_MODEL_DIR}
+  hf_model_revision: null
+  seq_length: 8192
+
+  # Legal on one 8-GPU H100 server (dense DP=4, expert DP=1). The model card's
+  # 16-GPU topology increases those dimensions to dense DP=8 and expert DP=2.
+  tensor_model_parallel_size: 1
+  pipeline_model_parallel_size: 1
+  context_parallel_size: 2
+  expert_model_parallel_size: 8
+  expert_tensor_parallel_size: 1
+  sequence_parallel: false
+  cp_comm_type: p2p
+
+  # Preserve the Lightning convergence contract.
+  moe_router_force_load_balancing: false
+  recompute_granularity: selective
+  recompute_modules: [moe, layernorm, core_attn]
+  mtp_num_layers: 2
+  mtp_hybrid_override_pattern: "*E"
+  mtp_use_repeated_layer: true
+  keep_mtp_spec_in_bf16: true
+  mtp_loss_scaling_factor: 0.3
+
+tokenizer:
+  tokenizer_model: ${oc.env:CPT_HF_MODEL_DIR}
+  hf_tokenizer_kwargs: {}
+
+dataset:
+  seq_length: 8192
+  path_to_cache: ${oc.env:CPT_DATA_CACHE}
+  num_workers: 8
+  reset_attention_mask: false
+  reset_position_ids: false
+  eod_mask_loss: false
+
+train:
+  train_iters: 47684
+  global_batch_size: 512
+  micro_batch_size: 1
+  # Strict fail-closed guard: consume and discard the entire global batch if
+  # any rank reports missing/NaN/Inf loss or grad norm. No optimizer/LR step.
+  skip_nonfinite_loss_and_grad: true
+
+# The strict guard above owns non-finite handling. Disable earlier assertions
+# so the bad batch reaches the guard and is skipped instead of aborting the job.
+ddp:
+  check_for_nan_in_grad: false
+  check_for_large_grads: false
+
+rerun_state_machine:
+  check_for_nan_in_loss: false
+
+# CPT starting point, not the scratch-pretraining LR inherited from the recipe.
+# Before the 200B run, sweep 1e-5/3e-5/1e-4 on a fixed short token horizon.
+optimizer:
+  lr: 3.0e-5
+  min_lr: 3.0e-6
+  adam_beta1: 0.9
+  adam_beta2: 0.95
+  adam_eps: 1.0e-8
+  weight_decay: 0.1
+  clip_grad: 1.0
+
+scheduler:
+  lr_decay_style: cosine
+  lr_warmup_iters: 477
+  lr_decay_iters: 47684
+  override_opt_param_scheduler: true
+
+validation:
+  eval_interval: 500
+  eval_iters: 20
+  # Pin these explicitly: older Bridge/Megatron-Core builds may default eval
+  # GBS to 1 instead of inheriting train.global_batch_size. 512 is divisible
+  # by the 16-node eval DP degree (32) with one sample per GPU microbatch.
+  eval_global_batch_size: 512
+  eval_micro_batch_size: 1
+
+logger:
+  log_interval: 10
+  tensorboard_dir: ${oc.env:CPT_RUN_ROOT}/tensorboard
+  log_timers_to_tensorboard: true
+  log_validation_ppl_to_tensorboard: true
+  wandb_save_dir: null
+  wandb_project: null
+  wandb_entity: null
+  wandb_exp_name: null
+
+checkpoint:
+  # On the first launch, no native checkpoint exists under `load`, so Bridge
+  # initializes model weights from `pretrained_checkpoint` and starts at step
+  # zero. Later launches find `load` and resume model/optimizer/scheduler/RNG.
+  pretrained_checkpoint: ${oc.env:CPT_BASE_CHECKPOINT}
+  save: ${oc.env:CPT_RUN_ROOT}/checkpoints
+  load: ${oc.env:CPT_RUN_ROOT}/checkpoints
+  ckpt_format: torch_dist
+  save_interval: 500
+  async_save: false
+  fully_parallel_save: true
+  save_optim: true
+  save_rng: true
+  load_optim: true
+  load_rng: true
+  finetune: false
+  dist_ckpt_strictness: log_all
+
+dist:
+  distributed_timeout_minutes: 90

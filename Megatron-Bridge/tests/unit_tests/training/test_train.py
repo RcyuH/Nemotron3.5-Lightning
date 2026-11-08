@@ -1,0 +1,1771 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+"""Tests for train module utility functions."""
+
+import math
+import signal
+import time
+from types import SimpleNamespace
+from unittest.mock import Mock, patch
+
+import pytest
+import torch
+from megatron.core.distributed.fsdp.mcore_fsdp_adapter import FullyShardedDataParallelV1
+from megatron.core.optimizer.distrib_optimizer import DistributedOptimizer
+
+from megatron.bridge.training.state import GlobalState
+from megatron.bridge.training.train import (
+    _delete_cuda_graphs,
+    _dummy_train_step,
+    _finish_train,
+    _handle_mxfp8_param_buffer_copy,
+    _losses_are_missing_or_nonfinite,
+    _maybe_register_fsdp_buffers,
+    _optimizer_step_with_nonfinite_guard,
+    _should_skip_and_handle_iteration,
+    checkpoint_and_decide_exit,
+    force_param_sync,
+    maybe_check_weight_hash_across_dp_replicas,
+    maybe_report_stragglers,
+    maybe_run_manual_gc,
+    maybe_synchronize_training_step,
+    save_checkpoint_and_time,
+    should_disable_forward_pre_hook,
+    train,
+    train_step,
+)
+from megatron.bridge.training.utils.train_utils import maybe_inject_state
+
+
+pytestmark = pytest.mark.unit
+
+
+class TestNonfiniteStepGuard:
+    @pytest.mark.parametrize(
+        "losses, expected",
+        [
+            ([{"lm loss": torch.tensor([4.0, 2.0])}], False),
+            ([{"lm loss": torch.tensor(float("inf"))}], True),
+            ([{"lm loss": torch.tensor(float("nan"))}], True),
+            ([{"lm loss": None}], True),
+            ([{"lm loss": (torch.tensor(4.0), torch.tensor(2.0))}], False),
+            ([{"lm loss": (torch.tensor(4.0), torch.tensor(float("inf")))}], True),
+            ([], True),
+        ],
+    )
+    def test_loss_guard_rejects_missing_and_nonfinite_values(self, losses, expected):
+        assert _losses_are_missing_or_nonfinite(losses) is expected
+
+    @pytest.mark.parametrize("grad_norm", [None, float("inf"), float("-inf"), float("nan")])
+    def test_optimizer_guard_discards_invalid_grad_norm_before_step(self, grad_norm):
+        class FakeOptimizer:
+            def __init__(self):
+                self.step_called = False
+                self.zero_grad_called = False
+
+            def prepare_grads(self):
+                return False
+
+            def get_grad_norm(self):
+                return grad_norm
+
+            def step(self):
+                self.step_called = True
+                return True, grad_norm, 0
+
+            def zero_grad(self):
+                self.zero_grad_called = True
+
+        optimizer = FakeOptimizer()
+        model = [Mock()]
+
+        result = _optimizer_step_with_nonfinite_guard(optimizer, model)
+
+        assert result[0] is False
+        assert result[2] is None
+        if grad_norm is None:
+            assert result[1] is None
+        elif math.isnan(grad_norm):
+            assert math.isnan(result[1])
+        else:
+            assert result[1] == grad_norm
+        assert optimizer.step_called is False
+        assert optimizer.zero_grad_called is True
+        model[0].zero_grad_buffer.assert_called_once_with()
+
+    def test_optimizer_guard_prepares_once_then_runs_native_step(self):
+        class FakeOptimizer:
+            def __init__(self):
+                self.prepare_calls = 0
+                self.grad_norm_calls = 0
+                self.prepare_result_seen_by_step = None
+                self.grad_norm_seen_by_step = None
+
+            def prepare_grads(self):
+                self.prepare_calls += 1
+                return False
+
+            def get_grad_norm(self):
+                self.grad_norm_calls += 1
+                return 2.0
+
+            def step(self):
+                self.prepare_result_seen_by_step = self.prepare_grads()
+                self.grad_norm_seen_by_step = self.get_grad_norm()
+                return True, 2.0, 0
+
+        optimizer = FakeOptimizer()
+
+        result = _optimizer_step_with_nonfinite_guard(optimizer, [Mock()])
+
+        assert result == (True, 2.0, 0)
+        assert optimizer.prepare_calls == 1
+        assert optimizer.grad_norm_calls == 1
+        assert optimizer.prepare_result_seen_by_step is False
+        assert optimizer.grad_norm_seen_by_step == 2.0
+        assert "prepare_grads" not in vars(optimizer)
+        assert "get_grad_norm" not in vars(optimizer)
+
+    @pytest.mark.parametrize("grouped_grad_norm", [None, float("inf"), float("nan")])
+    def test_optimizer_guard_rejects_nonfinite_separate_gradient_group(self, grouped_grad_norm):
+        class FakeOptimizer:
+            def __init__(self):
+                self.step_called = False
+
+            def prepare_grads(self):
+                return False
+
+            def get_grad_norm(self):
+                return 2.0
+
+            def _compute_grad_norms_by_group(self):
+                return {"mtp": grouped_grad_norm}
+
+            def step(self):
+                self.step_called = True
+                return True, 2.0, 0
+
+            def zero_grad(self):
+                pass
+
+        optimizer = FakeOptimizer()
+
+        result = _optimizer_step_with_nonfinite_guard(optimizer, [Mock()])
+
+        assert result == (False, 2.0, None)
+        assert optimizer.step_called is False
+
+
+class TestCheckpointManagerLifecycle:
+    """Tests for checkpoint manager ownership across the training lifecycle."""
+
+    def test_natural_completion_terminates_checkpoint_manager_once(self):
+        """The outer lifecycle should own the only terminal manager finalization."""
+
+        class OneShotCheckpointManager:
+            def __init__(self):
+                self.finalize_calls = []
+                self.terminated = False
+
+            def finalize_async_saves(self, state, blocking=False, terminate=False):
+                if self.terminated:
+                    raise RuntimeError("checkpoint manager was used after termination")
+                self.finalize_calls.append((blocking, terminate))
+                self.terminated = terminate
+
+        model_config = SimpleNamespace(cuda_graph_impl=None, fp8_recipe=None, param_sync_func=None)
+        config = SimpleNamespace(
+            train=SimpleNamespace(
+                train_iters=1,
+                manual_gc=False,
+                check_weight_hash_across_dp_replicas_interval=None,
+            ),
+            validation=SimpleNamespace(),
+            checkpoint=SimpleNamespace(save=None),
+            logger=SimpleNamespace(log_throughput_to_tensorboard=False),
+            model=SimpleNamespace(
+                virtual_pipeline_model_parallel_size=None,
+                cuda_graph_warmup_steps=0,
+                cuda_graph_use_single_mempool=False,
+                moe_expert_rank_capacity_factor=None,
+            ),
+            optimizer=SimpleNamespace(
+                use_distributed_optimizer=False,
+                optimizer_cuda_graph=False,
+                reuse_grad_buf_for_mxfp8_param_ag=False,
+            ),
+            ddp=SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=False),
+            straggler=None,
+            profiling=None,
+            tensor_inspect=None,
+        )
+        state = SimpleNamespace(
+            cfg=config,
+            train_state=SimpleNamespace(step=1, floating_point_operations_so_far=0.0),
+            timers=Mock(return_value=Mock()),
+            straggler_timer=Mock(),
+            energy_monitor=None,
+            nvrx_straggler_manager=None,
+            tensorboard_logger=None,
+            wandb_logger=None,
+            _comet_logger=None,
+            _signal_handler=None,
+        )
+        pg_collection = SimpleNamespace(
+            pp=SimpleNamespace(size=Mock(return_value=1)),
+            dp=SimpleNamespace(size=Mock(return_value=1)),
+        )
+        checkpoint_manager = OneShotCheckpointManager()
+
+        with (
+            patch("megatron.bridge.training.train.get_model_config", return_value=model_config),
+            patch(
+                "megatron.bridge.training.train.get_rerun_state_machine",
+                return_value=SimpleNamespace(current_iteration=1),
+            ),
+            patch("megatron.bridge.training.train.get_num_microbatches", return_value=1),
+            patch("megatron.bridge.training.train.get_forward_backward_func", return_value=Mock()),
+            patch("megatron.bridge.training.train.P2PCommunicator", return_value=Mock()),
+            patch("megatron.bridge.training.train._delete_cuda_graphs"),
+            patch("megatron.bridge.training.train.safe_shutdown_nvrx_straggler_manager"),
+            patch("megatron.bridge.training.train.destroy_global_state"),
+            patch("megatron.bridge.training.train.fault_tolerance"),
+        ):
+            train(
+                Mock(),
+                [Mock()],
+                Mock(),
+                Mock(),
+                None,
+                None,
+                state,
+                checkpoint_manager,
+                pg_collection,
+            )
+            _finish_train(state, checkpoint_manager)
+
+        assert checkpoint_manager.finalize_calls == [(True, False), (True, True)]
+
+    def test_natural_completion_restores_original_signal_handler(self):
+        """Terminal training cleanup should restore the caller's signal handler."""
+        original_handler = signal.getsignal(signal.SIGTERM)
+
+        def caller_handler(_signum, _frame):
+            pass
+
+        signal.signal(signal.SIGTERM, caller_handler)
+        state = GlobalState()
+        state.cfg = SimpleNamespace(
+            train=SimpleNamespace(exit_signal_handler=True, exit_signal=signal.SIGTERM),
+            nvrx_straggler=None,
+            logger=SimpleNamespace(wandb_project=None),
+        )
+
+        try:
+            with (
+                patch("megatron.bridge.training.train.safe_shutdown_nvrx_straggler_manager"),
+                patch("megatron.bridge.training.train.fault_tolerance"),
+                patch("megatron.bridge.training.train._delete_cuda_graphs"),
+                patch("megatron.bridge.training.train.destroy_global_state"),
+            ):
+                _finish_train(state, Mock())
+
+            assert signal.getsignal(signal.SIGTERM) is caller_handler
+        finally:
+            if state._signal_handler is not None:
+                state._signal_handler.release()
+            signal.signal(signal.SIGTERM, original_handler)
+
+
+class TestTrainStepAttentionLogitMonitoring:
+    """Unit tests for max-attention-logit collection in a training step."""
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=1)
+    @patch("megatron.bridge.training.train.get_model_config")
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.clip_qk", return_value=12.5)
+    def test_log_max_attention_logit_without_qk_clipping(
+        self,
+        mock_clip_qk,
+        mock_get_rerun_state_machine,
+        mock_get_model_config,
+        _mock_get_num_microbatches,
+    ):
+        """The independent monitoring flag collects logits without modifying weights."""
+        model_config = SimpleNamespace(seq_length=8)
+        mock_get_model_config.return_value = model_config
+
+        rerun_state_machine = Mock()
+        rerun_state_machine.should_run_forward_backward.side_effect = [True, False]
+        rerun_state_machine.should_checkpoint_and_exit.return_value = (False, False, 0)
+        mock_get_rerun_state_machine.return_value = rerun_state_machine
+
+        global_state = SimpleNamespace(
+            cfg=SimpleNamespace(
+                data_parallel_size=1,
+                model=SimpleNamespace(
+                    seq_length=8,
+                    qk_clip=False,
+                    log_max_attention_logit=True,
+                ),
+                dataset=SimpleNamespace(dataloader_type="single"),
+                dist=SimpleNamespace(use_decentralized_pg=True),
+                ddp=SimpleNamespace(overlap_param_gather=False),
+                optimizer=SimpleNamespace(
+                    barrier_with_L1_time=False,
+                    log_num_zeros_in_grad=False,
+                    reuse_grad_buf_for_mxfp8_param_ag=False,
+                ),
+                train=SimpleNamespace(
+                    check_optimizer_step_success=False,
+                    empty_unused_memory_level=0,
+                    micro_batch_size=1,
+                    skip_sync_grad_norm_across_mp=True,
+                ),
+            ),
+            timers=Mock(),
+        )
+        model = [Mock()]
+        optimizer = Mock()
+        optimizer.chained_optimizers = []
+        optimizer.step.return_value = (True, 1.0, 0)
+        scheduler = Mock()
+        forward_backward_func = Mock(return_value=[])
+        p2p_communicator = SimpleNamespace(is_pp_last_stage=False)
+        pg_collection = SimpleNamespace(mp=Mock())
+
+        result = train_step(
+            forward_step_func=Mock(),
+            data_iterator=None,
+            model=model,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            global_state=global_state,
+            pg_collection=pg_collection,
+            forward_backward_func=forward_backward_func,
+            p2p_communicator=p2p_communicator,
+        )
+
+        mock_clip_qk.assert_called_once_with(model, log_max_only=True)
+        assert result[-1] == 12.5
+
+
+class TestCudaGraphCleanup:
+    """Unit tests for CUDA graph state cleanup."""
+
+    def test_finish_train_deletes_recaptured_validation_graph_before_global_teardown(self):
+        """Final cleanup must delete CUDA graphs captured by post-training validation."""
+        from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+
+        validation_graph = Mock()
+        state = Mock()
+        state.wandb_logger = None
+        state._comet_logger = None
+        checkpoint_manager = Mock()
+
+        def assert_graph_deleted():
+            assert FullCudaGraphWrapper.cuda_graph["validation"] is None
+            assert FullCudaGraphWrapper.result["validation"] is None
+            assert FullCudaGraphWrapper.curr_iteration["validation"] == 0
+
+        with (
+            patch.object(FullCudaGraphWrapper, "cuda_graph", {"training": None, "validation": validation_graph}),
+            patch.object(FullCudaGraphWrapper, "result", {"training": None, "validation": object()}),
+            patch.object(FullCudaGraphWrapper, "curr_iteration", {"training": 0, "validation": 1}),
+            patch("megatron.bridge.training.train.safe_shutdown_nvrx_straggler_manager"),
+            patch("megatron.bridge.training.train.fault_tolerance"),
+            patch("megatron.bridge.training.train.destroy_global_state", side_effect=assert_graph_deleted),
+            patch("megatron.bridge.training.train.gc.collect"),
+        ):
+            _finish_train(state, checkpoint_manager)
+
+    @patch("megatron.bridge.training.train.gc.collect")
+    def test_delete_cuda_graphs_restores_full_graph_state(self, mock_collect):
+        """Cleanup must leave reusable full-graph mappings for the next training run."""
+        from megatron.core.full_cuda_graph import FullCudaGraphWrapper
+        from megatron.core.optimizer.optimizer_cuda_graph import OptimizerCudaGraphWrapper
+
+        graph = Mock()
+        FullCudaGraphWrapper.cuda_graph = {"training": graph, "validation": Mock()}
+        FullCudaGraphWrapper.result = {"training": object(), "validation": object()}
+        FullCudaGraphWrapper.curr_iteration = {"training": 3, "validation": 2}
+        OptimizerCudaGraphWrapper.cuda_graph = Mock()
+        OptimizerCudaGraphWrapper.result = object()
+        OptimizerCudaGraphWrapper.curr_iteration = 3
+        helper = Mock()
+        helper.graphs_created.return_value = False
+
+        _delete_cuda_graphs(helper)
+
+        assert FullCudaGraphWrapper.cuda_graph["training"] is None
+        assert FullCudaGraphWrapper.result["training"] is None
+        assert FullCudaGraphWrapper.curr_iteration["training"] == 0
+        assert FullCudaGraphWrapper.cuda_graph["validation"] is None
+        assert FullCudaGraphWrapper.result["validation"] is None
+        assert FullCudaGraphWrapper.curr_iteration["validation"] == 0
+        assert OptimizerCudaGraphWrapper.cuda_graph is None
+        assert OptimizerCudaGraphWrapper.result is None
+        assert OptimizerCudaGraphWrapper.curr_iteration == 0
+        helper.delete_cuda_graphs.assert_not_called()
+        mock_collect.assert_called_once()
+
+
+class TestFSDPRegistration:
+    """Unit tests for FSDP buffer manual registration."""
+
+    def test_maybe_register_fsdp_buffers_execution(self):
+        """Test that manual registration is called when conditions are met."""
+        # Setup mocks
+        config = Mock()
+        config.ddp.use_megatron_fsdp = True
+        config.ddp.fsdp_manual_registration = True
+
+        # Mock model chunk
+        model_chunk = Mock(spec=FullyShardedDataParallelV1)
+        # Mock ddp_config on the chunk
+        model_chunk.ddp_config = Mock()
+        model_chunk.ddp_config.fsdp_manual_registration = True
+
+        # Mock the buffer and its method
+        fsdp_buffer = Mock()
+        # Mock the manual_buffer_registration method which might be missing
+        fsdp_buffer.manual_buffer_registration = Mock()
+        model_chunk.param_and_grad_buffer = fsdp_buffer
+        model = [model_chunk]
+
+        # Run function
+        _maybe_register_fsdp_buffers(config, model)
+
+        # Verify registration was called
+        fsdp_buffer.manual_buffer_registration.assert_called_once()
+
+
+class TestPostTrainingStepHelpers:
+    """Unit tests for helper utilities extracted from the post-training callback."""
+
+    @patch("megatron.bridge.training.train.torch.cuda.synchronize")
+    def test_maybe_synchronize_training_step_triggers_on_interval(self, mock_sync):
+        maybe_synchronize_training_step(5, iteration=10)
+
+        mock_sync.assert_called_once()
+
+    @patch("megatron.bridge.training.train.torch.cuda.synchronize")
+    def test_maybe_synchronize_training_step_skips_when_not_due(self, mock_sync):
+        maybe_synchronize_training_step(5, iteration=7)
+        maybe_synchronize_training_step(None, iteration=10)
+
+        mock_sync.assert_not_called()
+
+    def test_maybe_report_stragglers_resets_counter_when_logging(self):
+        log_interval = 5
+        mock_timer = Mock()
+
+        updated = maybe_report_stragglers(
+            log_interval,
+            True,
+            mock_timer,
+            iteration=10,
+            num_floating_point_operations_since_last_log_event=123.0,
+        )
+
+        mock_timer.report.assert_called_once_with(123.0, log_interval)
+        assert updated == 0.0
+
+    def test_maybe_report_stragglers_noop_when_disabled(self):
+        mock_timer = Mock()
+
+        updated = maybe_report_stragglers(
+            7,
+            False,
+            mock_timer,
+            iteration=14,
+            num_floating_point_operations_since_last_log_event=321.0,
+        )
+
+        mock_timer.report.assert_not_called()
+        assert updated == 321.0
+
+    def test_maybe_report_stragglers_noop_when_interval_missing(self):
+        mock_timer = Mock()
+
+        updated = maybe_report_stragglers(
+            None,
+            True,
+            mock_timer,
+            iteration=21,
+            num_floating_point_operations_since_last_log_event=42.0,
+        )
+
+        mock_timer.report.assert_not_called()
+        assert updated == 42.0
+
+    @patch("megatron.bridge.training.train.print_rank_0")
+    @patch("megatron.bridge.training.train.torch.distributed.barrier")
+    @patch("megatron.bridge.training.train.check_param_hashes_across_dp_replicas", return_value=True)
+    @patch("megatron.bridge.training.train.enable_forward_pre_hook")
+    @patch("megatron.bridge.training.train.disable_forward_pre_hook")
+    def test_maybe_check_weight_hash_across_dp_replicas_runs_on_interval(
+        self,
+        mock_disable,
+        mock_enable,
+        mock_check,
+        mock_barrier,
+        mock_print,
+    ):
+        model = [Mock()]
+        optimizer = Mock()
+
+        maybe_check_weight_hash_across_dp_replicas(
+            model,
+            optimizer,
+            3,
+            iteration=6,
+            should_toggle_forward_pre_hook=True,
+        )
+
+        mock_disable.assert_called_once_with(model, optimizer=optimizer)
+        mock_check.assert_called_once_with(model, cross_check=True)
+        mock_barrier.assert_called_once()
+        mock_enable.assert_called_once_with(model)
+        mock_print.assert_called_once()
+
+    @patch("megatron.bridge.training.train.check_param_hashes_across_dp_replicas")
+    @patch("megatron.bridge.training.train.disable_forward_pre_hook")
+    @patch("megatron.bridge.training.train.enable_forward_pre_hook")
+    @patch("megatron.bridge.training.train.torch.distributed.barrier")
+    def test_maybe_check_weight_hash_across_dp_replicas_skips_when_interval_missing(
+        self,
+        mock_barrier,
+        mock_enable,
+        mock_disable,
+        mock_check,
+    ):
+        model = [Mock()]
+        optimizer = Mock()
+
+        maybe_check_weight_hash_across_dp_replicas(
+            model,
+            optimizer,
+            None,
+            iteration=4,
+            should_toggle_forward_pre_hook=False,
+        )
+
+        mock_disable.assert_not_called()
+        mock_check.assert_not_called()
+        mock_barrier.assert_not_called()
+        mock_enable.assert_not_called()
+
+    @patch("megatron.bridge.training.train.gc.collect")
+    def test_maybe_run_manual_gc_invokes_on_interval(self, mock_collect):
+        maybe_run_manual_gc(True, 4, iteration=8)
+
+        mock_collect.assert_called_once()
+
+    @patch("megatron.bridge.training.train.gc.collect")
+    def test_maybe_run_manual_gc_skips_when_disabled(self, mock_collect):
+        maybe_run_manual_gc(False, 4, iteration=8)
+        maybe_run_manual_gc(True, 0, iteration=8)
+        maybe_run_manual_gc(True, 5, iteration=8)
+
+        mock_collect.assert_not_called()
+
+
+class TestMxfp8ParamBufferCopy:
+    """Each optimizer's effective DDP policy controls its buffer copy."""
+
+    @pytest.mark.parametrize("chained", [False, True])
+    @pytest.mark.parametrize("reuse,overlap", [(False, False), (False, True), (True, False), (True, True)])
+    @pytest.mark.parametrize("hooks,captured", [(False, False), (True, False), (False, True)])
+    def test_effective_child_policy(self, chained, reuse, overlap, hooks, captured):
+        child = Mock(spec=DistributedOptimizer)
+        child.ddp_config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=reuse, overlap_param_gather=overlap)
+        ineligible = Mock(spec=DistributedOptimizer)
+        ineligible.ddp_config = SimpleNamespace(reuse_grad_buf_for_mxfp8_param_ag=False, overlap_param_gather=True)
+        other = Mock()
+        optimizer = SimpleNamespace(chained_optimizers=[child, ineligible, other]) if chained else child
+        model = [SimpleNamespace(remove_forward_pre_hook_handles=[object()] if hooks else [])]
+        with patch(
+            "megatron.bridge.training.train.FullCudaGraphWrapper.cuda_graph",
+            {"training": object() if captured else None},
+        ):
+            _handle_mxfp8_param_buffer_copy(optimizer, model)
+        assert child._copy_main_params_to_param_buffer.call_count == int(reuse and overlap and (hooks or captured))
+        ineligible._copy_main_params_to_param_buffer.assert_not_called()
+        other._copy_main_params_to_param_buffer.assert_not_called()
+
+    def test_no_eligible_optimizer_does_not_require_ddp_hooks(self):
+        _handle_mxfp8_param_buffer_copy(SimpleNamespace(chained_optimizers=[]), [object()])
+
+
+class TestShouldDisableForwardPreHook:
+    """Unit tests for should_disable_forward_pre_hook function."""
+
+    def test_disable_with_distributed_optimizer_and_overlap_no_fsdp(self):
+        """Test that pre-hook is disabled when using distributed optimizer + overlap without FSDP."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=False, use_distributed_optimizer=True, overlap_param_gather=True
+        )
+        assert result is True
+
+    def test_keep_enabled_with_megatron_fsdp(self):
+        """Test that pre-hook stays enabled when using Megatron FSDP."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=True, use_distributed_optimizer=True, overlap_param_gather=True
+        )
+        assert result is False
+
+    def test_callable_class_state_injection_integration(self):
+        """Integration test ensuring state injection works with functors in training context."""
+
+        class ForwardFunctor:
+            def __init__(self):
+                self.state_seen = None
+
+            def __call__(self, state, data_iterator, model, return_schedule_plan=False):
+                self.state_seen = state
+                return "ok"
+
+        mock_state = Mock()
+        functor = ForwardFunctor()
+
+        wrapped = maybe_inject_state(functor, mock_state)
+        assert callable(wrapped)
+
+        data_iterator = Mock()
+        model = Mock()
+        result = wrapped(data_iterator, model, return_schedule_plan=True)
+
+        assert result == "ok"
+        assert functor.state_seen is mock_state
+
+    def test_keep_enabled_without_distributed_optimizer(self):
+        """Test that pre-hook stays enabled when not using distributed optimizer."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=False, use_distributed_optimizer=False, overlap_param_gather=True
+        )
+        assert result is False
+
+    def test_keep_enabled_without_overlap_param_gather(self):
+        """Test that pre-hook stays enabled when not overlapping parameter gathering."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=False, use_distributed_optimizer=True, overlap_param_gather=False
+        )
+        assert result is False
+
+    def test_keep_enabled_all_false(self):
+        """Test that pre-hook stays enabled when all conditions are false."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=False, use_distributed_optimizer=False, overlap_param_gather=False
+        )
+        assert result is False
+
+    def test_keep_enabled_all_true_with_fsdp(self):
+        """Test that pre-hook stays enabled when FSDP is used (even with other conditions true)."""
+        result = should_disable_forward_pre_hook(
+            use_megatron_fsdp=True, use_distributed_optimizer=True, overlap_param_gather=True
+        )
+        assert result is False
+
+
+class TestForceParamSync:
+    """Unit tests for force_param_sync helper."""
+
+    def test_force_param_sync_invokes_ddp_start_param_sync(self):
+        """Ensure param synchronization is forced on each DDP chunk."""
+
+        class DummyDDP:
+            def __init__(self):
+                self.start_param_sync = Mock()
+
+        with patch("megatron.bridge.training.train.DDP", new=DummyDDP):
+            chunk1 = DummyDDP()
+            chunk2 = DummyDDP()
+
+            force_param_sync([chunk1, chunk2])
+
+            chunk1.start_param_sync.assert_called_once_with(force_sync=True)
+            chunk2.start_param_sync.assert_called_once_with(force_sync=True)
+
+
+class TestSaveCheckpointAndTime:
+    """Unit tests for save_checkpoint_and_time behavior."""
+
+    def _make_state(self) -> tuple[SimpleNamespace, Mock]:
+        timer_handle = Mock()
+        timers = Mock(return_value=timer_handle)
+        timers.log = Mock()
+
+        state = SimpleNamespace(
+            timers=timers,
+            energy_monitor=Mock(),
+            cfg=SimpleNamespace(
+                ddp=SimpleNamespace(use_megatron_fsdp=False, overlap_param_gather=True),
+                optimizer=SimpleNamespace(use_distributed_optimizer=True),
+                model=SimpleNamespace(fp8=None, seq_length=1),
+                logger=SimpleNamespace(log_progress=False),
+                checkpoint=SimpleNamespace(async_save=False),
+            ),
+            train_state=SimpleNamespace(
+                floating_point_operations_so_far=0,
+                consumed_train_samples=0,
+                step=1,
+            ),
+            start_time=0,
+        )
+
+        return state, timer_handle
+
+    @patch("megatron.bridge.training.train.force_param_sync")
+    @patch("megatron.bridge.training.train.should_disable_forward_pre_hook", return_value=True)
+    def test_param_sync_forced_when_overlap_enabled(
+        self,
+        mock_should_disable,
+        mock_force_param_sync,
+    ):
+        state, _ = self._make_state()
+        model = [Mock()]
+        optimizer = Mock()
+        mock_checkpoint_manager = Mock()
+
+        save_checkpoint_and_time(
+            state=state,
+            model=model,
+            optimizer=optimizer,
+            opt_param_scheduler=Mock(),
+            num_floating_point_operations_so_far=123.0,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        mock_should_disable.assert_called_once_with(False, True, True)
+        mock_force_param_sync.assert_called_once_with(model, optimizer=optimizer)
+        mock_checkpoint_manager.save.assert_called_once()
+
+    @patch("megatron.bridge.training.train.force_param_sync")
+    @patch("megatron.bridge.training.train.should_disable_forward_pre_hook", return_value=False)
+    def test_param_sync_skipped_when_not_required(
+        self,
+        mock_should_disable,
+        mock_force_param_sync,
+    ):
+        state, _ = self._make_state()
+        model = [Mock()]
+        mock_checkpoint_manager = Mock()
+
+        save_checkpoint_and_time(
+            state=state,
+            model=model,
+            optimizer=Mock(),
+            opt_param_scheduler=Mock(),
+            num_floating_point_operations_so_far=123.0,
+            checkpoint_manager=mock_checkpoint_manager,
+        )
+
+        mock_should_disable.assert_called_once_with(False, True, True)
+        mock_force_param_sync.assert_not_called()
+        mock_checkpoint_manager.save.assert_called_once()
+
+
+class TestCheckpointAndDecideExit:
+    """Unit tests for checkpoint_and_decide_exit function"""
+
+    def _create_mock_state(
+        self,
+        exit_duration_in_mins=None,
+        start_time=None,
+        checkpoint_save=False,
+        checkpoint_save_interval=None,
+        exit_signal_handler=False,
+        exit_interval=None,
+        step=0,
+    ):
+        """Helper method to create a mock state object with specified configuration."""
+        mock_state = Mock()
+
+        # Mock the configuration structure
+        mock_state.cfg.train.exit_duration_in_mins = exit_duration_in_mins
+        mock_state.cfg.train.exit_signal_handler = exit_signal_handler
+        mock_state.cfg.train.exit_interval = exit_interval
+        mock_state.cfg.checkpoint.save = checkpoint_save
+        mock_state.cfg.checkpoint.save_interval = checkpoint_save_interval
+        mock_state.cfg.checkpoint.non_persistent_save_interval = None
+
+        # Mock train state
+        mock_state.train_state.step = step
+
+        # Mock start_time
+        mock_state.start_time = start_time if start_time is not None else time.time()
+
+        # Mock other required attributes
+        mock_state.signal_handler = Mock()
+        mock_state.signal_handler.signals_received.return_value = []
+        mock_state.nvrx_straggler_manager = None
+
+        return mock_state
+
+    def _create_mock_args(self):
+        """Helper method to create mock arguments for checkpoint_and_decide_exit."""
+        return {
+            "model": [Mock()],
+            "optimizer": Mock(),
+            "opt_param_scheduler": Mock(),
+            "num_floating_point_operations_so_far": 1000.0,
+            "checkpoint_manager": Mock(),
+            "train_data_iterator": None,
+            "callback_manager": None,
+        }
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_duration_exit_uses_correct_start_time(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that duration exit logic uses state.start_time, not state.train_state.start_time."""
+        # Setup
+        current_time = 1000.0
+        start_time = 900.0  # 100 seconds ago
+        exit_duration_mins = 1.0  # 1 minute threshold
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        # Create state with start_time set to a specific value
+        state = self._create_mock_state(
+            exit_duration_in_mins=exit_duration_mins, start_time=start_time, checkpoint_save=False
+        )
+
+        # Mock torch tensor operations
+        mock_tensor = Mock()
+        mock_tensor.item.return_value = 1  # Simulate duration exceeded
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            args = self._create_mock_args()
+            result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify that the correct start_time was used in calculation
+        # train_time should be (1000.0 - 900.0) / 60.0 = 1.67 minutes
+        expected_train_time = (current_time - start_time) / 60.0
+        assert expected_train_time > exit_duration_mins
+
+        # Verify torch operations were called correctly
+        mock_all_reduce.assert_called_once()
+        mock_barrier_log.assert_called_once()
+
+        # Verify the log message contains the correct calculated time
+        log_call_args = mock_barrier_log.call_args[0][0]
+        assert f"exiting program after {expected_train_time}" in log_call_args
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_duration_exit_under_threshold_continues_training(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that training continues when duration is under the threshold."""
+        # Setup
+        current_time = 1000.0
+        start_time = 980.0  # 20 seconds ago
+        exit_duration_mins = 1.0  # 1 minute threshold
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_duration_in_mins=exit_duration_mins, start_time=start_time, checkpoint_save=False
+        )
+
+        # Mock torch tensor operations - duration NOT exceeded
+        mock_tensor = Mock()
+        mock_tensor.item.return_value = 0  # Simulate duration not exceeded
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            args = self._create_mock_args()
+            result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify torch operations were called
+        mock_all_reduce.assert_called_once()
+
+        # Verify no exit log message was called
+        mock_barrier_log.assert_not_called()
+        mock_save_checkpoint.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_duration_exit_with_checkpoint_saving(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that checkpoint is saved when exiting due to duration and checkpointing is enabled."""
+        # Setup
+        current_time = 1000.0
+        start_time = 900.0  # 100 seconds ago
+        exit_duration_mins = 1.0  # 1 minute threshold
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_duration_in_mins=exit_duration_mins,
+            start_time=start_time,
+            checkpoint_save=True,  # Enable checkpoint saving
+        )
+
+        # Mock torch tensor operations
+        mock_tensor = Mock()
+        mock_tensor.item.return_value = 1  # Simulate duration exceeded
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            args = self._create_mock_args()
+            result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify checkpoint was saved
+        mock_save_checkpoint.assert_called_once()
+
+        # Verify the correct arguments were passed to save_checkpoint_and_time
+        save_call_args = mock_save_checkpoint.call_args
+        assert save_call_args[0][0] == state  # state argument
+        assert save_call_args[0][1] == args["model"]  # model argument
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_duration_exit_no_checkpoint_when_already_saved(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that no additional checkpoint is saved if one was already saved in the same iteration."""
+        # Setup
+        current_time = 1000.0
+        start_time = 900.0  # 100 seconds ago
+        exit_duration_mins = 1.0  # 1 minute threshold
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_duration_in_mins=exit_duration_mins,
+            start_time=start_time,
+            checkpoint_save=True,
+            checkpoint_save_interval=1,  # This will cause a checkpoint to be saved first
+        )
+
+        # Mock torch tensor operations
+        mock_tensor = Mock()
+        mock_tensor.item.return_value = 1  # Simulate duration exceeded
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            args = self._create_mock_args()
+            result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify checkpoint was saved only once (for the regular interval, not for exit)
+        assert mock_save_checkpoint.call_count == 1
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_no_duration_exit_when_disabled(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that duration-based exit is skipped when exit_duration_in_mins is not set."""
+        # Setup
+        current_time = 1000.0
+        start_time = 900.0  # 100 seconds ago
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_duration_in_mins=None,  # Disabled
+            start_time=start_time,
+            checkpoint_save=False,
+        )
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify no torch operations were called for duration checking
+        mock_all_reduce.assert_not_called()
+        mock_barrier_log.assert_not_called()
+        mock_save_checkpoint.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    @patch("torch.distributed.all_reduce")
+    @patch("time.time")
+    def test_duration_calculation_precision(
+        self, mock_time, mock_all_reduce, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that duration calculation handles edge cases and precision correctly."""
+        # Setup - test with fractional minutes
+        current_time = 1090.5  # Fractional seconds
+        start_time = 1000.0
+        exit_duration_mins = 1.5  # 1.5 minutes threshold
+
+        mock_time.return_value = current_time
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_duration_in_mins=exit_duration_mins, start_time=start_time, checkpoint_save=False
+        )
+
+        # Mock torch tensor operations - should NOT exceed threshold
+        # (1090.5 - 1000.0) / 60.0 = 1.508 minutes, which is > 1.5
+        mock_tensor = Mock()
+        mock_tensor.item.return_value = 1  # Simulate duration exceeded
+
+        with patch("torch.tensor", return_value=mock_tensor) as mock_torch_tensor:
+            args = self._create_mock_args()
+            result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify the tensor was created with the correct comparison
+        # The tensor should contain [True] since 1.508 > 1.5
+        tensor_call_args = mock_torch_tensor.call_args[0][0]  # First positional argument
+        expected_train_time = (current_time - start_time) / 60.0
+        assert tensor_call_args == [expected_train_time > exit_duration_mins]
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_signal_handler_exit_with_signals(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test exit when signal handler is enabled and signals are received."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(exit_signal_handler=True, checkpoint_save=True)
+
+        # Mock signal handler to return received signals
+        state.signal_handler.signals_received.return_value = ["SIGTERM"]
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify checkpoint was saved and correct log message
+        mock_save_checkpoint.assert_called_once()
+        mock_barrier_log.assert_called_once_with("exiting program after receiving SIGTERM.")
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_signal_handler_exit_no_signals(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test that training continues when signal handler is enabled but no signals received."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(exit_signal_handler=True, checkpoint_save=True)
+
+        # Mock signal handler to return no signals
+        state.signal_handler.signals_received.return_value = []
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue)
+        assert result is False
+
+        # Verify no exit-related actions were taken
+        mock_barrier_log.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_iteration_interval_exit(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test exit when iteration interval is reached."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_interval=10,
+            step=20,  # 20 % 10 == 0, should trigger exit
+            checkpoint_save=True,
+        )
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify checkpoint was saved and correct log message
+        mock_save_checkpoint.assert_called_once()
+        mock_barrier_log.assert_called_once_with("exiting program at iteration 20")
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_iteration_interval_not_reached(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test that training continues when iteration interval is not reached."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_interval=10,
+            step=15,  # 15 % 10 != 0, should not trigger exit
+            checkpoint_save=True,
+        )
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue)
+        assert result is False
+
+        # Verify no exit-related actions were taken
+        mock_barrier_log.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_nvrx_straggler_detection_exit(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test exit when NVRx straggler detection triggers."""
+        mock_check_nvrx.return_value = True
+
+        state = self._create_mock_state(checkpoint_save=True)
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify checkpoint was saved and correct log message
+        mock_save_checkpoint.assert_called_once()
+        mock_barrier_log.assert_called_once_with("Exiting program due to straggler detection.")
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_regular_persistent_checkpoint_save(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test regular persistent checkpoint saving."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            checkpoint_save=True,
+            checkpoint_save_interval=5,
+            step=10,  # 10 % 5 == 0, should save checkpoint
+        )
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify checkpoint was saved
+        mock_save_checkpoint.assert_called_once()
+
+        # Verify train_data_iterator was passed correctly
+        save_call_args = mock_save_checkpoint.call_args
+        assert "train_data_iterator" in save_call_args[1]
+        assert "non_persistent_ckpt" not in save_call_args[1]  # Should not be non-persistent
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_regular_non_persistent_checkpoint_save(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test regular non-persistent checkpoint saving."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            checkpoint_save=True,
+            checkpoint_save_interval=None,  # No persistent saves
+            step=15,
+        )
+
+        # Set non-persistent save interval
+        state.cfg.checkpoint.non_persistent_save_interval = 3
+        # 15 % 3 == 0, should save non-persistent checkpoint
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify checkpoint was saved with non_persistent_ckpt=True
+        mock_save_checkpoint.assert_called_once()
+        save_call_args = mock_save_checkpoint.call_args
+        assert save_call_args[1]["non_persistent_ckpt"] is True
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_local_checkpoint_does_not_suppress_persistent_exit_checkpoint(
+        self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """A planned exit must persist state even when a local save is also due."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            checkpoint_save=True,
+            checkpoint_save_interval=100,
+            exit_interval=10,
+            step=10,
+        )
+        state.cfg.checkpoint.non_persistent_save_interval = 10
+        state.cfg.checkpoint.non_persistent_ckpt_type = "local"
+
+        result = checkpoint_and_decide_exit(state, **self._create_mock_args())
+
+        assert result is True
+        assert mock_save_checkpoint.call_count == 2
+        assert mock_save_checkpoint.call_args_list[0].kwargs["non_persistent_ckpt"] is True
+        assert mock_save_checkpoint.call_args_list[1].kwargs.get("non_persistent_ckpt", False) is False
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_no_checkpoint_when_disabled(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test that no checkpoint is saved when checkpointing is disabled."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            checkpoint_save=False,  # Disabled
+            checkpoint_save_interval=5,
+            step=10,  # Would normally trigger save
+        )
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify no checkpoint was saved
+        mock_save_checkpoint.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_multiple_exit_conditions_signal_wins(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test that signal handler exit takes precedence over other exit conditions."""
+        mock_check_nvrx.return_value = True  # Straggler detection would also trigger
+
+        state = self._create_mock_state(
+            exit_signal_handler=True,
+            exit_interval=10,
+            step=10,  # Would also trigger iteration exit
+            checkpoint_save=True,
+        )
+
+        # Mock signal handler to return received signals
+        state.signal_handler.signals_received.return_value = ["SIGTERM"]
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # Verify signal handler message was logged, not straggler message
+        mock_barrier_log.assert_called_once_with("exiting program after receiving SIGTERM.")
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_checkpoint_save_none_vs_false(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test the difference between checkpoint.save being None vs False for straggler detection."""
+        mock_check_nvrx.return_value = True
+
+        state = self._create_mock_state()
+        state.cfg.checkpoint.save = None  # Explicitly set to None
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns True (should exit)
+        assert result is True
+
+        # For straggler detection, checkpoint should NOT be saved when save is None
+        # (note the condition: state.cfg.checkpoint.save is not None)
+        mock_save_checkpoint.assert_not_called()
+        mock_barrier_log.assert_called_once_with("Exiting program due to straggler detection.")
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_no_exit_conditions_met(self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint):
+        """Test that function returns False when no exit conditions are met."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            exit_signal_handler=False,
+            exit_duration_in_mins=None,
+            exit_interval=None,
+            checkpoint_save=False,
+            step=7,  # Doesn't match any interval
+        )
+
+        # Ensure no signals are received
+        state.signal_handler.signals_received.return_value = []
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify no actions were taken
+        mock_save_checkpoint.assert_not_called()
+        mock_barrier_log.assert_not_called()
+
+    @patch("megatron.bridge.training.train.save_checkpoint_and_time")
+    @patch("megatron.bridge.training.train.barrier_and_log")
+    @patch("megatron.bridge.training.train.check_nvrx_straggler_detection")
+    def test_persistent_checkpoint_priority_over_non_persistent(
+        self, mock_check_nvrx, mock_barrier_log, mock_save_checkpoint
+    ):
+        """Test that persistent checkpoint takes priority over non-persistent when both intervals match."""
+        mock_check_nvrx.return_value = False
+
+        state = self._create_mock_state(
+            checkpoint_save=True,
+            checkpoint_save_interval=5,  # Persistent every 5 steps
+            step=10,  # 10 % 5 == 0, would trigger persistent
+        )
+
+        # Set non-persistent save interval that would also trigger
+        state.cfg.checkpoint.non_persistent_save_interval = 2  # 10 % 2 == 0, would also trigger
+
+        args = self._create_mock_args()
+        result = checkpoint_and_decide_exit(state, **args)
+
+        # Verify the function returns False (should continue training)
+        assert result is False
+
+        # Verify checkpoint was saved exactly once
+        mock_save_checkpoint.assert_called_once()
+
+        # Verify it was a PERSISTENT checkpoint (no non_persistent_ckpt flag)
+        save_call_args = mock_save_checkpoint.call_args
+        assert (
+            "non_persistent_ckpt" not in save_call_args[1] or save_call_args[1].get("non_persistent_ckpt") is not True
+        )
+
+        # Verify the persistent checkpoint arguments were used
+        assert save_call_args[0][0] == state  # state argument
+        assert save_call_args[0][1] == args["model"]  # model argument
+        assert "train_data_iterator" in save_call_args[1]
+
+
+class TestIterationSkipping:
+    """Unit tests for iteration skipping functionality."""
+
+    def _create_mock_global_state(self, step=0, iterations_to_skip=None, micro_batch_size=4):
+        """Helper method to create a mock global state."""
+        mock_state = Mock()
+        mock_state.train_state.step = step
+        mock_state.train_state.consumed_train_samples = 0
+        mock_state.train_state.skipped_train_samples = 0
+
+        # Mock configuration
+        mock_state.cfg.train.iterations_to_skip = iterations_to_skip or []
+        mock_state.cfg.train.micro_batch_size = micro_batch_size
+
+        return mock_state
+
+    def _make_fake_pg(self, dp_size: int):
+        class _DP:
+            def __init__(self, size: int) -> None:
+                self._size = size
+
+            def size(self) -> int:
+                return self._size
+
+        class _PG:
+            def __init__(self, size: int) -> None:
+                self.dp = _DP(size)
+
+        return _PG(dp_size)
+
+    @patch("megatron.bridge.training.train._dummy_train_step")
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=4)
+    def test_should_skip_iteration_when_step_in_skip_list(self, mock_get_microbatches, mock_dummy_step):
+        """Test that iteration is skipped when step+1 matches iterations_to_skip (1-based)."""
+        # step=4 → iteration 5 (1-based), skip list contains 5
+        global_state = self._create_mock_global_state(step=4, iterations_to_skip=[3, 5, 10])
+        train_data_iterator = Mock()
+
+        # Call function
+        fake_pg = self._make_fake_pg(2)
+        result = _should_skip_and_handle_iteration(global_state, train_data_iterator, fake_pg)
+
+        # Verify
+        assert result is True
+        mock_dummy_step.assert_called_once_with(global_state, train_data_iterator, fake_pg)
+
+        # Verify state updates
+        assert global_state.train_state.step == 5  # incremented
+        expected_batch_size = 2 * 4 * 4  # dp_world_size * micro_batch_size * num_microbatches
+        assert global_state.train_state.consumed_train_samples == expected_batch_size
+        assert global_state.train_state.skipped_train_samples == expected_batch_size
+
+    @patch("megatron.bridge.training.train._dummy_train_step")
+    def test_should_not_skip_iteration_when_step_not_in_skip_list(self, mock_dummy_step):
+        """Test that iteration is not skipped when step+1 is not in iterations_to_skip."""
+        # step=7 → iteration 8, not in [3, 5, 10]
+        global_state = self._create_mock_global_state(step=7, iterations_to_skip=[3, 5, 10])
+        train_data_iterator = Mock()
+
+        # Call function
+        fake_pg = self._make_fake_pg(1)
+        result = _should_skip_and_handle_iteration(global_state, train_data_iterator, fake_pg)
+
+        # Verify
+        assert result is False
+        mock_dummy_step.assert_not_called()
+
+        # Verify state not modified
+        assert global_state.train_state.step == 7  # unchanged
+        assert global_state.train_state.consumed_train_samples == 0  # unchanged
+        assert global_state.train_state.skipped_train_samples == 0  # unchanged
+
+    @patch("megatron.bridge.training.train._dummy_train_step")
+    def test_should_not_skip_when_skip_list_empty(self, mock_dummy_step):
+        """Test that iteration is not skipped when iterations_to_skip list is empty."""
+        # Setup
+        global_state = self._create_mock_global_state(step=5, iterations_to_skip=[])
+        train_data_iterator = Mock()
+
+        # Call function
+        fake_pg = self._make_fake_pg(1)
+        result = _should_skip_and_handle_iteration(global_state, train_data_iterator, fake_pg)
+
+        # Verify
+        assert result is False
+        mock_dummy_step.assert_not_called()
+
+    @patch("megatron.bridge.training.train._dummy_train_step")
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=2)
+    def test_batch_size_calculation_with_different_parallelism(self, mock_get_microbatches, mock_dummy_step):
+        """Test batch size calculation with different parallelism settings."""
+        # step=9 → iteration 10 (1-based), skip list contains 10
+        global_state = self._create_mock_global_state(step=9, iterations_to_skip=[10], micro_batch_size=8)
+        train_data_iterator = Mock()
+
+        # Call function
+        fake_pg = self._make_fake_pg(8)
+        result = _should_skip_and_handle_iteration(global_state, train_data_iterator, fake_pg)
+
+        # Verify
+        assert result is True
+        expected_batch_size = 8 * 8 * 2  # dp_world_size * micro_batch_size * num_microbatches = 128
+        assert global_state.train_state.consumed_train_samples == expected_batch_size
+        assert global_state.train_state.skipped_train_samples == expected_batch_size
+
+
+class TestDummyTrainStep:
+    """Unit tests for _dummy_train_step functionality."""
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=3)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=True)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_advances_iterator_on_first_stage(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step advances iterator on first pipeline stage."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, False]  # Run once then stop
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was called correct number of times (num_microbatches)
+        assert train_data_iterator.__next__.call_count == 3
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=3)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=False)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=True)
+    def test_dummy_train_step_advances_iterator_on_last_stage(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step advances iterator on last pipeline stage."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, False]
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was called correct number of times
+        assert train_data_iterator.__next__.call_count == 3
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=3)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=False)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_does_not_advance_iterator_on_middle_stage(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step does not advance iterator on middle pipeline stages."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, False]
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was NOT called
+        train_data_iterator.__next__.assert_not_called()
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=2)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=True)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_handles_multiple_rerun_cycles(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step handles multiple rerun state machine cycles."""
+        # Setup
+        mock_rerun_machine = Mock()
+        # Simulate two cycles of forward/backward before stopping
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, True, False]
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was called 2 cycles * 2 microbatches = 4 times
+        assert train_data_iterator.__next__.call_count == 4
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=1)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=True)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_no_rerun_cycles(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step handles case where no rerun cycles are needed."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.return_value = False  # No cycles needed
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was not called at all
+        train_data_iterator.__next__.assert_not_called()
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=0)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=True)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_zero_microbatches(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step handles zero microbatches correctly."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, False]
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+
+        # Create a mock iterator that tracks next() calls
+        train_data_iterator = Mock()
+        train_data_iterator.__iter__ = Mock(return_value=train_data_iterator)
+        train_data_iterator.__next__ = Mock(return_value={})
+
+        # Call function
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+        # Verify next() was not called when num_microbatches is 0
+        train_data_iterator.__next__.assert_not_called()
+
+    @patch("megatron.bridge.training.train.get_num_microbatches", return_value=2)
+    @patch("megatron.bridge.training.train.get_rerun_state_machine")
+    @patch("megatron.bridge.training.train.is_pp_first_stage", return_value=True)
+    @patch("megatron.bridge.training.train.is_pp_last_stage", return_value=False)
+    def test_dummy_train_step_handles_none_iterator(
+        self, mock_is_last_stage, mock_is_first_stage, mock_get_rerun_machine, mock_get_microbatches
+    ):
+        """Test that dummy_train_step handles None data iterator correctly."""
+        # Setup
+        mock_rerun_machine = Mock()
+        mock_rerun_machine.should_run_forward_backward.side_effect = [True, False]
+        mock_get_rerun_machine.return_value = mock_rerun_machine
+
+        global_state = Mock()
+        train_data_iterator = None  # None iterator
+
+        # Call function - should not raise an error
+        fake_pg = type("PG", (), {"pp": object()})()
+        _dummy_train_step(global_state, train_data_iterator, fake_pg)
+
+
+@pytest.mark.parametrize(
+    "microbatches, remote, expected",
+    [
+        ([[0.0, 0.0], [0.0, 0.0]], [0.0, 0.0], 0.0),
+        ([[0.0, 0.0]], [12.0, 3.0], 4.0),
+        ([[6.0, 2.0], [15.0, 3.0]], [9.0, 1.0], 5.0),
+        ([[2.0], [6.0]], [0.0, 0.0], 4.0),
+    ],
+)
+@patch("megatron.bridge.training.train.get_data_distribution_group")
+@patch("megatron.bridge.training.train.torch.distributed.all_reduce")
+@patch("megatron.bridge.training.train.get_num_microbatches", return_value=1)
+@patch("megatron.bridge.training.train.get_model_config")
+@patch("megatron.bridge.training.train.get_rerun_state_machine")
+def test_train_step_token_weighted_loss(
+    mock_get_rerun_state_machine,
+    mock_get_model_config,
+    _mock_get_num_microbatches,
+    mock_reduce,
+    mock_get_group,
+    microbatches,
+    remote,
+    expected,
+):
+    import torch
+
+    model_config = SimpleNamespace(seq_length=8)
+    mock_get_model_config.return_value = model_config
+
+    rerun_state_machine = Mock()
+    rerun_state_machine.should_run_forward_backward.side_effect = [True, False]
+    rerun_state_machine.should_checkpoint_and_exit.return_value = (False, False, 0)
+    mock_get_rerun_state_machine.return_value = rerun_state_machine
+
+    global_state = SimpleNamespace(
+        cfg=SimpleNamespace(
+            data_parallel_size=1,
+            model=SimpleNamespace(
+                seq_length=8,
+                qk_clip=False,
+                log_max_attention_logit=False,
+            ),
+            dataset=SimpleNamespace(dataloader_type="single"),
+            dist=SimpleNamespace(use_decentralized_pg=True),
+            ddp=SimpleNamespace(overlap_param_gather=False),
+            optimizer=SimpleNamespace(
+                barrier_with_L1_time=False,
+                log_num_zeros_in_grad=False,
+                reuse_grad_buf_for_mxfp8_param_ag=False,
+            ),
+            train=SimpleNamespace(
+                check_optimizer_step_success=False,
+                empty_unused_memory_level=0,
+                micro_batch_size=1,
+                skip_sync_grad_norm_across_mp=True,
+            ),
+        ),
+        timers=Mock(),
+    )
+    model = [Mock()]
+    optimizer = Mock(chained_optimizers=[])
+    optimizer.step.return_value = (True, 1.0, 0)
+    scheduler = Mock()
+    forward_backward_func = Mock(return_value=[{"lm loss": torch.tensor(v)} for v in microbatches])
+    p2p_communicator = SimpleNamespace(is_pp_last_stage=True)
+    pg_collection = SimpleNamespace(mp=Mock())
+
+    dp_cp = object()
+    mock_get_group.return_value = dp_cp
+    mock_reduce.side_effect = lambda value, **kwargs: value.add_(torch.tensor(remote))
+    result = train_step(
+        forward_step_func=Mock(),
+        data_iterator=None,
+        model=model,
+        optimizer=optimizer,
+        scheduler=scheduler,
+        global_state=global_state,
+        pg_collection=pg_collection,
+        forward_backward_func=forward_backward_func,
+        p2p_communicator=p2p_communicator,
+    )
+
+    assert result[0]["lm loss"].item() == pytest.approx(expected)
+    assert torch.isfinite(result[0]["lm loss"])
+    if len(microbatches[0]) == 2:
+        mock_reduce.assert_called_once()
+        assert mock_reduce.call_args.kwargs["group"] is dp_cp
+    else:
+        mock_reduce.assert_not_called()

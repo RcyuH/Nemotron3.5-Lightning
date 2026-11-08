@@ -1,0 +1,846 @@
+diff --git a/examples/models/nemotron/nemotron_3/lightning/README.md b/examples/models/nemotron/nemotron_3/lightning/README.md
+index 49c6bc8c0..946d19ec3 100644
+--- a/examples/models/nemotron/nemotron_3/lightning/README.md
++++ b/examples/models/nemotron/nemotron_3/lightning/README.md
+@@ -43,3 +43,11 @@ default, removes earlier reasoning text while retaining its empty `<think></thin
+ to preserve reasoning from all historical assistant turns. The assistant thinking prefix `<think>\n` and an empty
+ `<think></think>` pair are masked. For non-empty reasoning, the reasoning text and closing `</think>` token are
+ supervised, along with final-answer and structured tool-call tokens. System, user, and tool-response tokens are masked.
++
++## MTP-only healing after post-training
++
++Use `mtp_healing.py` with a local HF or Megatron checkpoint and generated response
++JSONL to train only the repeated Lightning MTP block. The initial layout targets
++2 nodes with 8 B200 GPUs per node (EP=16, TP=PP=CP=1), using BF16 and all-to-all.
++See [the Vietnamese MTP-healing guide](MTP_HEALING.vi.md) for data formats,
++checkpoint initialization versus resume, launch commands, and validation limits.
+diff --git a/src/megatron/bridge/recipes/nemotronh/__init__.py b/src/megatron/bridge/recipes/nemotronh/__init__.py
+index 651456223..e1fd40b0c 100644
+--- a/src/megatron/bridge/recipes/nemotronh/__init__.py
++++ b/src/megatron/bridge/recipes/nemotronh/__init__.py
+@@ -23,6 +23,9 @@ from megatron.bridge.recipes.nemotronh.gb200 import (
+     nemotron_3_super_pretrain_64gpu_gb200_bf16_config,
+     nemotron_3_ultra_pretrain_256gpu_gb200_bf16_ep16_config,
+ )
++from megatron.bridge.recipes.nemotronh.nemotron_3_5_lightning import (
++    nemotron_3_5_lightning_mtp_healing_config,
++)
+ from megatron.bridge.recipes.nemotronh.nemotron_3_nano import (
+     nemotron_3_5_lightning_peft_config,
+     nemotron_3_5_lightning_pretrain_config,
+@@ -98,6 +101,7 @@ __all__ = [
+     "nemotron_nano_9b_v2_peft_config",
+     "nemotron_nano_12b_v2_peft_config",
+     # Nemotron 3 Nano and Nemotron 3.5 Lightning models
++    "nemotron_3_5_lightning_mtp_healing_config",
+     "nemotron_3_5_lightning_peft_config",
+     "nemotron_3_5_lightning_pretrain_8k_config",
+     "nemotron_3_5_lightning_pretrain_8k_fsdp_config",
+diff --git a/src/megatron/bridge/recipes/nemotronh/nemotron_3_5_lightning.py b/src/megatron/bridge/recipes/nemotronh/nemotron_3_5_lightning.py
+new file mode 100644
+index 000000000..012c8942f
+--- /dev/null
++++ b/src/megatron/bridge/recipes/nemotronh/nemotron_3_5_lightning.py
+@@ -0,0 +1,116 @@
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""MTP-only healing for post-trained Nemotron 3.5 Lightning checkpoints."""
++
++from typing import cast
++
++from megatron.bridge import AutoBridge
++from megatron.bridge.data.builders import ChatSFTPreprocessingConfig, DirectHFSFTDatasetConfig, HFDatasetSourceConfig
++from megatron.bridge.models.hybrid.hybrid_provider import HybridModelProvider
++from megatron.bridge.recipes.common import _sft_common
++from megatron.bridge.training.config import ConfigContainer
++
++
++NEMOTRON_3_5_LIGHTNING_HF_MODEL_ID = "nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16"
++
++
++def nemotron_3_5_lightning_mtp_healing_config(
++    *, hf_model_path: str = NEMOTRON_3_5_LIGHTNING_HF_MODEL_ID
++) -> ConfigContainer:
++    """Build a BF16 MTP-healing recipe, initially mapped to 16 GPUs (EP=16).
++
++    Load architecture and tokenizer metadata from the actual post-trained HF
++    snapshot. Weights are loaded later through ``checkpoint.pretrained_checkpoint``.
++    Only ``mtp.layers.*`` is optimized; the shared embedding, LM head, backbone,
++    and backbone router expert biases stay frozen by Bridge's native setup hook.
++
++    Args:
++        hf_model_path: HF snapshot containing config/tokenizer files, including
++            the original Lightning MTP configuration. Also used with a native
++            Megatron weight checkpoint. Prefer a local snapshot for offline jobs.
++
++    Returns:
++        Config requiring a checkpoint and a rollout data source before training.
++        LR, schedule and MTP loss weight are starting settings, not paper values.
++
++    Raises:
++        ValueError: The source is not a compatible Lightning model with MTP.
++    """
++    cfg = _sft_common()
++    model = AutoBridge.from_hf_pretrained(hf_model_path).to_megatron_provider(load_weights=False)
++    if not isinstance(model, HybridModelProvider):
++        raise ValueError("MTP healing requires a Nemotron-H HybridModelProvider.")
++    if (model.num_layers, model.hidden_size, model.num_moe_experts) != (52, 2688, 128):
++        raise ValueError("Expected the Nemotron 3.5 Lightning 30B-A3B architecture.")
++    if not model.mtp_num_layers or model.mtp_hybrid_override_pattern != "*E":
++        raise ValueError("Checkpoint config must retain Lightning's attention+MoE MTP block (*E).")
++    if not model.mtp_use_repeated_layer:
++        raise ValueError("Expected Lightning's shared/repeated MTP block.")
++    cfg.model = cast(HybridModelProvider, model)
++
++    # Same repeated-head objective as the Lightning SFT recipe and old Super code.
++    model.mtp_num_layers = 2
++    model.mtp_use_repeated_layer = True
++    model.keep_mtp_spec_in_bf16 = True
++    model.mtp_loss_scaling_factor = 0.3
++    model.mtp_detach_heads = True
++    model.freeze_base_model_for_mtp = True
++    model.calculate_per_token_loss = True
++
++    # A conservative 2 x 8 B200 layout. All-to-all does not require DeepEP.
++    model.tensor_model_parallel_size = 1
++    model.pipeline_model_parallel_size = 1
++    model.virtual_pipeline_model_parallel_size = None
++    model.context_parallel_size = 1
++    model.expert_model_parallel_size = 16
++    model.expert_tensor_parallel_size = 1
++    model.sequence_parallel = False
++    model.seq_length = 4096
++    model.moe_token_dispatcher_type = "alltoall"
++    model.moe_shared_expert_overlap = False
++    model.moe_router_force_load_balancing = False
++    model.apply_rope_fusion = False
++    model.attention_backend = "fused"
++    model.use_fused_weighted_squared_relu = True
++    model.cuda_graph_impl = "none"
++    model.recompute_granularity = None
++    cfg.ddp.use_distributed_optimizer = True
++    cfg.optimizer.use_distributed_optimizer = True
++    cfg.ddp.overlap_grad_reduce = False
++    cfg.ddp.overlap_param_gather = False
++
++    # A complete response per row by default; no cross-conversation packing.
++    cfg.dataset = DirectHFSFTDatasetConfig(
++        seq_length=model.seq_length,
++        source=HFDatasetSourceConfig(path_or_dataset="json", split="train"),
++        preprocessing=ChatSFTPreprocessingConfig(loss_mode="last_turn"),
++        do_validation=False,
++        do_test=False,
++        pad_to_max_length=True,
++        enable_in_batch_packing=False,
++    )
++    cfg.validation.eval_iters = 0
++    cfg.tokenizer.tokenizer_model = hf_model_path
++    cfg.tokenizer.hf_tokenizer_kwargs = {}
++    cfg.checkpoint.hf_source_path = hf_model_path
++    # Reject tensors required by this model but absent from the checkpoint;
++    # allow unused source optimizer tensors when initializing from a full-SFT run.
++    cfg.checkpoint.dist_ckpt_strictness = "raise_unexpected"
++    cfg.checkpoint.load = None
++    cfg.peft = None
++    return cfg
++
++
++__all__ = ["nemotron_3_5_lightning_mtp_healing_config"]
+diff --git a/examples/models/nemotron/nemotron_3/lightning/mtp_healing.py b/examples/models/nemotron/nemotron_3/lightning/mtp_healing.py
+new file mode 100644
+index 000000000..c12cb31bd
+--- /dev/null
++++ b/examples/models/nemotron/nemotron_3/lightning/mtp_healing.py
+@@ -0,0 +1,251 @@
++#!/usr/bin/env python3
++# Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
++#
++# Licensed under the Apache License, Version 2.0 (the "License");
++# you may not use this file except in compliance with the License.
++# You may obtain a copy of the License at
++#
++#     http://www.apache.org/licenses/LICENSE-2.0
++#
++# Unless required by applicable law or agreed to in writing, software
++# distributed under the License is distributed on an "AS IS" BASIS,
++# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++# See the License for the specific language governing permissions and
++# limitations under the License.
++
++"""Heal Lightning's MTP block from local HF or native Megatron weights."""
++
++from __future__ import annotations
++
++import argparse
++import json
++import logging
++import math
++import os
++from pathlib import Path
++from typing import TYPE_CHECKING
++
++
++if TYPE_CHECKING:
++    from megatron.bridge.training.callbacks import CallbackContext
++    from megatron.bridge.training.config import ConfigContainer
++
++logger = logging.getLogger(__name__)
++
++
++def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
++    """Parse training inputs; keep help and schema preflight usable without CUDA."""
++    parser = argparse.ArgumentParser(description=__doc__)
++    parser.add_argument("--pretrained-checkpoint", required=True, type=Path)
++    parser.add_argument(
++        "--hf-model-path",
++        type=Path,
++        help="Matching local HF config/tokenizer snapshot; required for Megatron weights.",
++    )
++    parser.add_argument("--train-data", required=True, nargs="+", type=Path)
++    parser.add_argument("--output-dir", required=True, type=Path)
++    parser.add_argument("--data-format", choices=("messages", "input-output"), default="messages")
++    parser.add_argument("--loss-mode", choices=("last_turn", "assistant"), default="last_turn")
++    parser.add_argument("--seq-length", type=int, default=4096)
++    parser.add_argument("--train-iters", type=int, default=1000)
++    parser.add_argument("--warmup-iters", type=int, default=50)
++    parser.add_argument("--lr", type=float, default=5e-6)
++    parser.add_argument("--global-batch-size", type=int, default=128)
++    parser.add_argument("--micro-batch-size", type=int, default=1)
++    parser.add_argument("--tp", type=int, choices=(1, 2), default=1)
++    parser.add_argument("--ep", type=int, default=16)
++    parser.add_argument("--cp", type=int, default=1)
++    parser.add_argument("--save-interval", type=int, default=100)
++    parser.add_argument("--resume", action="store_true", help="Resume this output directory's native checkpoint.")
++    parser.add_argument(
++        "--check-inputs",
++        action="store_true",
++        help="Check paths, HF metadata and every JSONL row without importing the training stack.",
++    )
++    return parser.parse_args(argv)
++
++
++def validate_inputs(args: argparse.Namespace) -> int:
++    """Validate local input schemas; return row count (zero outside preflight).
++
++    This is deliberately not a tokenizer, weight-integrity or GPU smoke test.
++    The native checkpoint loader validates required weights during training.
++    """
++    for key in ("seq_length", "train_iters", "global_batch_size", "micro_batch_size", "ep", "cp", "save_interval"):
++        if getattr(args, key) <= 0:
++            raise ValueError(f"{key} must be positive")
++    if not math.isfinite(args.lr) or args.lr <= 0:
++        raise ValueError("lr must be positive and finite")
++    if not 0 <= args.warmup_iters < args.train_iters:
++        raise ValueError("Require 0 <= warmup-iters < train-iters")
++    if 128 % args.ep:
++        raise ValueError("ep must divide Lightning's 128 experts")
++    if args.seq_length % (128 * args.cp):
++        raise ValueError("seq-length must be divisible by 128 * cp for this padded Mamba recipe")
++    if not args.pretrained_checkpoint.is_dir():
++        raise ValueError("pretrained-checkpoint must be an existing local directory")
++    if args.hf_model_path is None:
++        args.hf_model_path = args.pretrained_checkpoint
++    config_path = args.hf_model_path / "config.json"
++    if not config_path.is_file() or not (args.hf_model_path / "tokenizer_config.json").is_file():
++        raise ValueError("hf-model-path must contain the matching HF config.json and tokenizer_config.json")
++    hf_config = json.loads(config_path.read_text())
++    if hf_config.get("model_type") != "nemotron_h" or (
++        hf_config.get("num_hidden_layers"),
++        hf_config.get("hidden_size"),
++        hf_config.get("n_routed_experts"),
++    ) != (52, 2688, 128):
++        raise ValueError("HF metadata must describe Nemotron 3.5 Lightning 30B-A3B")
++    if not hf_config.get("num_nextn_predict_layers"):
++        raise ValueError("HF metadata has no MTP head; restore compatible MTP config AND weights before healing")
++    if args.pretrained_checkpoint.resolve() == args.output_dir.resolve():
++        raise ValueError("Use a separate output-dir, not the source checkpoint directory")
++    checkpoint_dir = args.output_dir / "checkpoints"
++    if args.resume:
++        if not (checkpoint_dir / "latest_checkpointed_iteration.txt").is_file():
++            raise ValueError("--resume requires output-dir/checkpoints/latest_checkpointed_iteration.txt")
++    elif args.output_dir.exists() and any(args.output_dir.iterdir()):
++        raise ValueError("Output directory is not empty; use a new directory or --resume for an existing healing run")
++    for path in args.train_data:
++        if not path.is_file():
++            raise ValueError(f"Missing training JSONL: {path}")
++    # torchrun supplies WORLD_SIZE. PP=1 and ETP=1 are fixed in this entry point.
++    if "WORLD_SIZE" in os.environ:
++        world = int(os.environ["WORLD_SIZE"])
++        if world <= 0 or world % (args.tp * args.cp) or world % args.ep:
++            raise ValueError("WORLD_SIZE must be divisible by both tp*cp and ep")
++        dp = world // (args.tp * args.cp)
++        if args.global_batch_size % (dp * args.micro_batch_size):
++            raise ValueError("global-batch-size must be divisible by DP * micro-batch-size")
++    if not args.check_inputs:
++        return 0
++    count = 0
++    for path in args.train_data:
++        file_count = 0
++        with path.open() as stream:
++            for line_number, line in enumerate(stream, 1):
++                row = json.loads(line)
++                if not isinstance(row, dict):
++                    raise ValueError(f"{path}:{line_number}: each row must be an object")
++                if args.data_format == "messages":
++                    messages = row.get("messages")
++                    if (
++                        not isinstance(messages, list)
++                        or not messages
++                        or any(not isinstance(message, dict) or "role" not in message for message in messages)
++                    ):
++                        raise ValueError(f"{path}:{line_number}: expected a nonempty messages list")
++                    if messages[-1]["role"] != "assistant":
++                        raise ValueError(
++                            f"{path}:{line_number}: rollout row must end with the generated assistant turn"
++                        )
++                    answer = messages[-1]
++                    if not any(answer.get(key) for key in ("content", "reasoning_content", "tool_calls")):
++                        raise ValueError(f"{path}:{line_number}: empty assistant response")
++                elif not all(isinstance(row.get(key), str) and row[key] for key in ("input", "output")):
++                    raise ValueError(f"{path}:{line_number}: expected nonempty input/output strings")
++                count += 1
++                file_count += 1
++        if not file_count:
++            raise ValueError(f"Training JSONL is empty: {path}")
++    return count
++
++
++def build_config(args: argparse.Namespace) -> ConfigContainer:
++    """Apply explicit run inputs to the MTP-only recipe."""
++    from megatron.bridge.data.builders import ChatSFTPreprocessingConfig, HFDatasetSourceConfig
++    from megatron.bridge.data.sft_processing import PromptCompletionSFTPreprocessingConfig
++    from megatron.bridge.recipes.nemotronh import nemotron_3_5_lightning_mtp_healing_config
++
++    cfg = nemotron_3_5_lightning_mtp_healing_config(hf_model_path=str(args.hf_model_path))
++    cfg.model.seq_length = args.seq_length
++    cfg.model.tensor_model_parallel_size = args.tp
++    cfg.model.sequence_parallel = args.tp > 1
++    cfg.model.expert_model_parallel_size = args.ep
++    cfg.model.context_parallel_size = args.cp
++    cfg.model.cp_comm_type = "p2p"
++    cfg.dataset.seq_length = args.seq_length
++    cfg.dataset.source = HFDatasetSourceConfig(
++        path_or_dataset="json", split="train", load_kwargs={"data_files": [str(p) for p in args.train_data]}
++    )
++    if args.data_format == "messages":
++        cfg.dataset.preprocessing = ChatSFTPreprocessingConfig(loss_mode=args.loss_mode)
++    else:
++        # Input is the exact rendered generation prefix, output the sampled
++        # continuation. Never insert the old recipe's extra separating space.
++        cfg.dataset.preprocessing = PromptCompletionSFTPreprocessingConfig(
++            prompt_column="input",
++            completion_column="output",
++            separator="",
++            strip_whitespace=False,
++            add_eos=False,
++            loss_mode="completion",
++        )
++    cfg.train.train_iters = args.train_iters
++    cfg.train.global_batch_size = args.global_batch_size
++    cfg.train.micro_batch_size = args.micro_batch_size
++    cfg.optimizer.lr = args.lr
++    cfg.scheduler.lr_warmup_iters = args.warmup_iters
++    cfg.scheduler.lr_decay_iters = args.train_iters
++    cfg.checkpoint.pretrained_checkpoint = str(args.pretrained_checkpoint)
++    cfg.checkpoint.save = str(args.output_dir / "checkpoints")
++    cfg.checkpoint.load = cfg.checkpoint.save if args.resume else None
++    # pretrained_checkpoint starts at step zero with new optimizer/RNG state;
++    # checkpoint.load resumes the complete healing state. Do not force finetune
++    # or no_load_optim here: those switches would break resume semantics.
++    cfg.checkpoint.save_interval = args.save_interval
++    cfg.scheduler.override_opt_param_scheduler = not args.resume
++    cfg.logger.tensorboard_dir = str(args.output_dir / "tb_logs")
++    cfg.logger.log_interval = 1
++    return cfg
++
++
++def verify_mtp_only(context: CallbackContext) -> None:
++    """Fail before step one if the actual model did not freeze as requested."""
++    trainable = 0
++    frozen = 0
++    for chunk in context.model:
++        for name, parameter in chunk.named_parameters():
++            is_mtp = "mtp.layers." in name
++            if parameter.requires_grad != is_mtp:
++                raise RuntimeError(f"Unexpected requires_grad={parameter.requires_grad}: {name}")
++            if parameter.requires_grad:
++                trainable += parameter.numel()
++            else:
++                frozen += parameter.numel()
++        for name, module in chunk.named_modules():
++            if hasattr(module, "expert_bias") and "mtp.layers." not in name:
++                if not getattr(module, "frozen_expert_bias", False):
++                    raise RuntimeError(f"Backbone router expert_bias is not frozen: {name}")
++    if not trainable or not frozen:
++        raise RuntimeError("Expected both trainable MTP parameters and frozen backbone parameters on each PP=1 rank")
++    logger.info("MTP freeze verified on this rank: %s trainable, %s frozen parameter elements", trainable, frozen)
++
++
++def main() -> None:
++    """Run schema preflight or distributed MTP healing."""
++    logging.basicConfig(level=logging.INFO)
++    args = parse_args()
++    count = validate_inputs(args)
++    if args.check_inputs:
++        logger.info(
++            "Input preflight passed: %d rows. Weight loading, token masks and GPU training are not checked.", count
++        )
++        return
++    if "WORLD_SIZE" not in os.environ:
++        raise ValueError(
++            "Launch training with uv run python -m torch.distributed.run; use --check-inputs for CPU preflight"
++        )
++    from megatron.bridge.training.callbacks import CallbackManager
++    from megatron.bridge.training.finetune import finetune
++    from megatron.bridge.training.gpt_step import forward_step
++
++    cfg = build_config(args)
++    logger.info("MTP-only healing: EP=%d TP=%d CP=%d; output=%s", args.ep, args.tp, args.cp, args.output_dir)
++    callbacks = CallbackManager()
++    callbacks.register("on_train_start", verify_mtp_only)
++    finetune(config=cfg, forward_step_func=forward_step, callbacks=callbacks)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/examples/models/nemotron/nemotron_3/lightning/MTP_HEALING.vi.md b/examples/models/nemotron/nemotron_3/lightning/MTP_HEALING.vi.md
+new file mode 100644
+index 000000000..544420550
+--- /dev/null
++++ b/examples/models/nemotron/nemotron_3/lightning/MTP_HEALING.vi.md
+@@ -0,0 +1,159 @@
++# MTP-Healing cho model post-trained từ Nemotron 3.5 Lightning
++
++## Kết quả kiểm tra bộ `magic_code`
++
++Bộ được cung cấp có **đúng 4 file Python** (không tính thư mục cache):
++
++| File cũ | Vai trò xác minh được trong nội dung |
++| --- | --- |
++| `recipes/nemotronh/__init__.py` | Export `nemotron_3_super_mtp_healing_config`. |
++| `recipes/nemotronh/nemotron_3_super.py` | Recipe healing; detach MTP; pre-wrap hook chỉ bật gradient cho `mtp.layers.*`; khóa cập nhật expert bias của router backbone. |
++| `data/datasets/sft.py` | Truyền `last_assistant_only_loss` từ factory vào chat dataset. |
++| `data/datasets/utils.py` | Tạo mask cho span assistant cuối; báo lỗi nếu HF chat template thiếu `{% generation %}`. |
++
++Đây là xác nhận **nội dung bộ file**, không phải xác nhận rằng lần train cũ chỉ có 4 thay đổi trên server. Thư mục `/opt/Megatron-Bridge` không tồn tại trên máy kiểm tra; không có Git diff của server, lệnh launch, config override hay snapshot tokenizer của lần chạy cũ. Hai file dataset thuộc đường chat HF; recipe healing cũ mặc định lại dùng `input/output`, nên thay đổi mask đó chỉ có hiệu lực nếu launcher đổi dataset sang chat.
++
++Các phụ thuộc có thể nằm ngoài 4 file: phiên bản Megatron-Core hỗ trợ `mtp_detach_heads`, `frozen_expert_bias` trong gradient finalization, checkpoint còn MTP, tokenizer/chat template và launcher/config dữ liệu. Nếu template thiếu generation block, bộ code cũ yêu cầu sửa template ở ngoài bốn file. Không đủ bằng chứng để khẳng định bạn đã sửa những file đó trong lần chạy cũ.
++
++## Cơ sở và phiên bản
++
++Trang 26, §3.2 của **NVIDIA Nemotron 3 Super Technical Report** mô tả: freeze các trọng số ngoài MTP, dùng lại prompt RLVR, train MTP bằng negative log likelihood trên response được generate. Phần này không cung cấp LR, số step, batch size hay chiều dài context để tái lập chính xác. Code ở đây áp dụng cùng phương pháp cho Lightning, không khẳng định tái lập mọi hyperparameter của NVIDIA.
++
++Nguồn kiến trúc: [HF config Lightning](https://huggingface.co/nvidia/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-BF16/blob/main/config.json), [tài liệu Bridge Lightning](https://docs.nvidia.com/nemo/megatron-bridge/nightly/models/nemotron/nemotron3.5-lightning.html).
++
++Code viết cho checkout Bridge `ec4ec358c`, Megatron-Core `feba4e1eb31bdc217e9e3f767baaddf3fdd17854`. Dùng container CUDA tương thích với checkout này và B200. Đây **không phải** patch drop-in cho mọi phiên bản Bridge cũ: bản hiện tại đã thay `sft.py` bằng cấu trúc dataset/config mới. Đặc biệt cần có:
++
++- `model.freeze_base_model_for_mtp`, hook `_freeze_base_model_for_mtp` trong `training/setup.py`, và Core hỗ trợ chạy backbone với `no_grad`.
++- `mtp_detach_heads` và xử lý `frozen_expert_bias` trong Core.
++- `DirectHFSFTDatasetConfig`, `ChatSFTPreprocessingConfig(loss_mode="last_turn")` và logic chat Lightning hiện có.
++- Nạp HF local qua `checkpoint.pretrained_checkpoint`, kiểm tra các weight mapping bắt buộc.
++
++Không chép đè hai file dataset cũ vào checkout mới. Các sửa đổi có sẵn về skip nonfinite ở `training/config.py`, `training/train.py`, `training/utils/train_utils.py`, `tests/unit_tests/training/test_train.py` được giữ nguyên; recipe này không phụ thuộc vào bật cờ đó.
++
++## Các file mới và hành vi
++
++- `src/megatron/bridge/recipes/nemotronh/nemotron_3_5_lightning.py`: `nemotron_3_5_lightning_mtp_healing_config`.
++- `src/megatron/bridge/recipes/nemotronh/__init__.py`: export recipe.
++- `examples/models/nemotron/nemotron_3/lightning/mtp_healing.py`: entry point cho HF/Megatron và hai dạng dữ liệu.
++- Hai file test ở `tests/unit_tests/examples/test_lightning_mtp_healing.py` và `tests/unit_tests/recipes/nemotronh/test_nemotron_3_5_lightning_healing.py`.
++
++Model metadata được đọc từ `--hf-model-path` của **model bạn**, không lấy weight từ model NVIDIA rồi ghi đè checkpoint bạn. Với HF checkpoint, mặc định đường này là `--pretrained-checkpoint`. Với Megatron checkpoint, truyền HF snapshot tương ứng; cần có `config.json` và các file tokenizer.
++
++Chỉ `mtp.layers.*` có gradient. Embedding, LM output head, backbone và cập nhật expert bias của router backbone bị khóa bằng cơ chế native. `mtp_detach_heads=True` tách các đầu vào/head dùng chung khỏi graph MTP. Callback trước step đầu kiểm tra trực tiếp `requires_grad`, sự tồn tại của tham số trainable và cờ khóa router trên từng rank; callback này không thay thế việc so sánh giá trị tensor trước/sau train.
++
++Lightning có **một block MTP chung trọng số**, bên trong là attention + MoE (`*E`). `mtp_num_layers=2` là hai độ sâu dự đoán qua block lặp; HF thường ghi `num_nextn_predict_layers=1`. Không tạo hai bộ trọng số MTP độc lập.
++
++Thiết lập khởi đầu: BF16, TP=1, PP=1, CP=1, EP=16, ETP=1, micro batch=1, global batch=128, context=4096, LR=5e-6, warmup=50, train=1000 step. LR/optimizer/schedule kế thừa `_sft_common`; MTP coefficient=0.3 như recipe Lightning SFT và bộ Super cũ. Vẫn giữ MoE auxiliary balancing loss mặc định từ Bridge (`1e-4`) và weight decay; đây không phải một objective loại bỏ toàn bộ regularization. Nếu muốn thí nghiệm NLL thuần, sửa `cfg.model.moe_aux_loss_coeff` và weight decay/schedule tương ứng rồi ghi nhận đó là thí nghiệm khác.
++
++Dùng all-to-all, không cần DeepEP; packing và CUDA graphs tắt. Đây là cấu hình khởi đầu, **chưa benchmark hay xác nhận fit/throughput trên B200**. 4096 là ví dụ, không phải độ dài bắt buộc của healing. Với rollout dài cần chọn context đủ dài: truncation có thể làm mất response được giám sát. Kiểm tra sample đã tokenize và số token có loss trước khi chạy dài.
++
++## Chuẩn bị dữ liệu
++
++Response nên là rollout từ checkpoint post-train bạn muốn heal. Dùng prompt RLVR/mixture gần workload mục tiêu; tách held-out prompts để đo chất lượng MTP. Script không tự generate rollout.
++
++### `messages` (khuyến nghị)
++
++Mỗi dòng là một JSON object, kết thúc bằng assistant response đã generate:
++
++```json
++{"messages":[{"role":"user","content":"Tính 1 + 1."},{"role":"assistant","reasoning_content":"Cộng hai số một.","content":"2"}],"chat_template_kwargs":{"enable_thinking":true,"truncate_history_thinking":true}}
++```
++
++Giữ `reasoning_content`, top-level `tools`, assistant `tool_calls` nếu rollout có dùng. Dùng tokenizer/chat template chính thức của snapshot; không thay bằng ChatML generic. `chat_template_kwargs` phải khớp cách render prompt lúc lấy rollout. Đặc biệt, chỉ giữ reasoning lịch sử nếu rollout cũng giữ nó.
++
++Mặc định `--loss-mode last_turn` chỉ giám sát assistant turn cuối, bao gồm reasoning/content/tool calls được mask đúng bởi Bridge. Dùng `--loss-mode assistant` nếu muốn giám sát tất cả assistant turns trong trajectory. Với trajectory có tool, thường lưu từng prefix + assistant response làm một row cho `last_turn`, hoặc dùng `assistant` cho toàn trajectory. Không dùng full-sequence loss vì sẽ train cả prompt/user/tool response.
++
++### `input/output`
++
++`input` phải là **prompt đã render hoàn chỉnh đúng lúc generation**; `output` là phần continuation model đã sinh. Nếu hiện tại `input` chỉ là câu hỏi tự nhiên chưa qua template, chuyển sang `messages` hoặc render trước.
++
++```json
++{"input":"<|im_start|>user\nTính 1 + 1.<|im_end|>\n<|im_start|>assistant\n<think>\n","output":"Cộng hai số một.\n</think>\n2<|im_end|>"}
++```
++
++Ví dụ minh họa schema; hãy dùng `apply_chat_template` của snapshot để tạo prefix thật. Script không chèn dấu cách, không strip whitespace, không tự thêm BOS/EOS, và chỉ tính loss trên `output`. Vì vậy cần giữ token kết thúc trong continuation nếu muốn supervise nó. Hai trường được tokenize riêng rồi nối; với serialization đặc biệt hãy kiểm tra token IDs có khớp rollout gốc, nhất là ranh giới prefix/continuation.
++
++## Chạy trên 2 nodes B200
++
++Ví dụ giả định **8 GPU/node** và shared filesystem. Chạy từ repo root trong cùng container/môi trường trên cả hai node, cùng code/version, paths và config. Với allocation khác, chỉnh `--nproc_per_node` và EP; cả `WORLD_SIZE % (TP*CP)` và `WORLD_SIZE % EP` phải bằng 0, EP chia hết 128 experts. Global batch phải chia hết `DP * micro_batch`; với 16 GPU và TP=CP=1, gradient accumulation là 8.
++
++Schema preflight (không cần CUDA, không kiểm tra tensor weights/tokenization):
++
++```bash
++uv run --no-sync python examples/models/nemotron/nemotron_3/lightning/mtp_healing.py \
++  --pretrained-checkpoint /checkpoints/my-lightning-posttrain-hf \
++  --train-data /data/healing/train.jsonl \
++  --output-dir /runs/lightning-mtp-healing \
++  --data-format messages --check-inputs
++```
++
++Trên **cả hai node**, đặt `MASTER_ADDR` thành địa chỉ có thể truy cập của node 0; `NODE_RANK=0` trên node 0, `NODE_RANK=1` trên node 1. Tránh trùng port với job khác.
++
++```bash
++export MASTER_ADDR=NODE0_REACHABLE_ADDRESS
++export MASTER_PORT=29500
++export NODE_RANK=0  # node còn lại dùng 1
++export PYTHONPATH="${PWD}/src:${PWD}/3rdparty/Megatron-LM:${PYTHONPATH:-}"
++
++uv run --no-sync python -m torch.distributed.run \
++  --nnodes=2 --nproc_per_node=8 --node_rank="$NODE_RANK" \
++  --master_addr="$MASTER_ADDR" --master_port="$MASTER_PORT" \
++  examples/models/nemotron/nemotron_3/lightning/mtp_healing.py \
++  --pretrained-checkpoint /checkpoints/my-lightning-posttrain-hf \
++  --train-data /data/healing/train.jsonl \
++  --output-dir /runs/lightning-mtp-healing \
++  --data-format messages --loss-mode last_turn \
++  --tp 1 --ep 16 --cp 1 --seq-length 4096 \
++  --global-batch-size 128 --micro-batch-size 1 \
++  --lr 5e-6 --train-iters 1000 --warmup-iters 50 --save-interval 100
++```
++
++Nạp **Megatron**: thay/đặt hai option dưới đây, dùng checkpoint chứa model weights đầy đủ và còn MTP:
++
++```bash
++--pretrained-checkpoint /checkpoints/my-lightning-posttrain-megatron \
++--hf-model-path /checkpoints/my-lightning-posttrain-hf
++```
++
++Chọn `--data-format input-output` cho dữ liệu đã render. Có thể truyền nhiều JSONL sau `--train-data`. Lần đầu dùng output directory mới/trống. **Resume healing** bằng cùng command, cùng data/config và thêm `--resume`; optimizer/scheduler/RNG được phục hồi từ `output-dir/checkpoints`. Không dùng `--resume` để bắt đầu từ optimizer của lần SFT/RL cũ.
++
++Nếu post-training đã bỏ MTP weights/config, khôi phục một MTP block tương thích trước khi healing. Không chỉ đổi `num_nextn_predict_layers` cho qua check: loader vẫn cần trọng số MTP thực tế. Recipe từ chối metadata thiếu MTP; HF loader kiểm tra mappings, native loader dùng `raise_unexpected` để lỗi khi thiếu tensor cần nạp.
++
++## Kiểm chứng trước khi train dài và export
++
++Chạy thử 5 step trên cluster với output directory riêng, `--train-iters 5 --warmup-iters 1 --save-interval 5`, giữ nguyên các option còn lại. Xác nhận log `MTP freeze verified`, `mtp_1 loss`, `mtp_2 loss`, gradient hữu hạn, checkpoint được lưu và resume thành công. `lm loss` vẫn có thể được log dù backbone bị freeze; không dùng riêng đường LM loss để đánh giá MTP healing.
++
++Để xác minh freeze đầy đủ, export snapshot trước/sau theo cùng cách rồi so sánh các tensor ngoài `mtp.*`, gồm embedding, LM head và router expert biases; chúng phải giữ nguyên. MTP weights cần thay đổi sau optimizer step. Đo acceptance rate/tokens accepted của MTP trên held-out rollout và workload serving thực tế; NLL giảm chưa đủ chứng minh tăng tốc decoding.
++
++Checkpoint đầu ra là native Megatron, lưu cả model. Export HF bằng công cụ sẵn có, chạy trong môi trường GPU tương thích (ví dụ layout 1 node EP=8 để reshard):
++
++```bash
++./scripts/conversion/convert.sh export \
++  --executor local --device gpu --gpus-per-node 8 \
++  --tp 1 --pp 1 --ep 8 --etp 1 \
++  --hf-model /checkpoints/my-lightning-posttrain-hf \
++  --megatron-path /runs/lightning-mtp-healing/checkpoints/iter_0001000 \
++  --hf-path /exports/my-lightning-healed-hf \
++  --torch-dtype bfloat16 --distributed-save
++```
++
++Kiểm tra export còn `mtp.*` và dùng đúng config/tokenizer. Không tái sử dụng output prefix của input checkpoint.
++
++## Tests và giới hạn xác minh
++
++Đã chạy local: 26 test CPU về schema/paths, resume, topology/batch và runtime freeze guard; Ruff; kiểm tra cú pháp. Các test CPU dùng entry point thật với tham số/tensor metadata giả lập cho freeze guard, không chạy autograd của model thật.
++
++```bash
++uv run --no-project --with pytest python -m pytest --noconftest -o addopts='' \
++  tests/unit_tests/examples/test_lightning_mtp_healing.py -q
++```
++
++Test recipe cần môi trường Bridge đầy đủ:
++
++```bash
++uv run --no-sync python -m pytest \
++  tests/unit_tests/recipes/nemotronh/test_nemotron_3_5_lightning_healing.py \
++  tests/unit_tests/models/nemotronh/test_nemotron_3_5_chat.py -q
++```
++
++Chưa chạy được test recipe với stack Megatron thật, nạp checkpoint thực tế, forward/backward, export hay benchmark B200 ở máy local vì môi trường này thiếu PyTorch/CUDA. Không xem kết quả CPU là chứng nhận training end-to-end.
+diff --git a/tests/unit_tests/examples/test_lightning_mtp_healing.py b/tests/unit_tests/examples/test_lightning_mtp_healing.py
+new file mode 100644
+index 000000000..1de52273c
+--- /dev/null
++++ b/tests/unit_tests/examples/test_lightning_mtp_healing.py
+@@ -0,0 +1,195 @@
++"""CPU-only input and freeze-guard tests; no Megatron/CUDA imports required."""
++
++import importlib.util
++import json
++from pathlib import Path
++from types import SimpleNamespace
++from unittest.mock import Mock
++
++import pytest
++
++
++SCRIPT = Path(__file__).resolve().parents[3] / "examples/models/nemotron/nemotron_3/lightning/mtp_healing.py"
++spec = importlib.util.spec_from_file_location("lightning_mtp_healing", SCRIPT)
++healing = importlib.util.module_from_spec(spec)
++spec.loader.exec_module(healing)
++
++
++@pytest.fixture
++def args(tmp_path, monkeypatch):
++    monkeypatch.delenv("WORLD_SIZE", raising=False)
++    hf = tmp_path / "hf"
++    hf.mkdir()
++    (hf / "config.json").write_text(
++        json.dumps(
++            {
++                "model_type": "nemotron_h",
++                "num_hidden_layers": 52,
++                "hidden_size": 2688,
++                "n_routed_experts": 128,
++                "num_nextn_predict_layers": 1,
++            }
++        )
++    )
++    (hf / "tokenizer_config.json").write_text("{}")
++    data = tmp_path / "rollouts.jsonl"
++    data.write_text(
++        json.dumps(
++            {
++                "messages": [
++                    {"role": "user", "content": "Q"},
++                    {"role": "assistant", "content": "A"},
++                ]
++            }
++        )
++        + "\n"
++    )
++    return healing.parse_args(
++        [
++            "--pretrained-checkpoint",
++            str(hf),
++            "--train-data",
++            str(data),
++            "--output-dir",
++            str(tmp_path / "out"),
++            "--check-inputs",
++        ]
++    )
++
++
++def test_chat_preflight_selects_custom_hf(args):
++    assert healing.validate_inputs(args) == 1
++    assert args.hf_model_path == args.pretrained_checkpoint
++
++
++def test_megatron_requires_hf_metadata(args, tmp_path):
++    args.pretrained_checkpoint = tmp_path / "native"
++    args.pretrained_checkpoint.mkdir()
++    with pytest.raises(ValueError, match="matching HF"):
++        healing.validate_inputs(args)
++
++
++def test_megatron_accepts_separate_hf_metadata(args, tmp_path):
++    args.hf_model_path = args.pretrained_checkpoint
++    args.pretrained_checkpoint = tmp_path / "native"
++    args.pretrained_checkpoint.mkdir()
++    assert healing.validate_inputs(args) == 1
++
++
++def test_rendered_input_output_preflight(args):
++    args.data_format = "input-output"
++    args.train_data[0].write_text(json.dumps({"input": "<prefix>\n", "output": " A<eos>"}) + "\n")
++    assert healing.validate_inputs(args) == 1
++
++
++@pytest.mark.parametrize(
++    "response",
++    [
++        {"role": "assistant", "content": "", "reasoning_content": "reason"},
++        {"role": "assistant", "content": None, "tool_calls": [{"function": {"name": "tool"}}]},
++    ],
++)
++def test_reasoning_and_tool_call_responses_are_allowed(args, response):
++    args.train_data[0].write_text(json.dumps({"messages": [{"role": "user", "content": "Q"}, response]}) + "\n")
++    assert healing.validate_inputs(args) == 1
++
++
++@pytest.mark.parametrize(
++    "row",
++    [
++        [],
++        {"messages": []},
++        {"messages": [None]},
++        {"messages": [{"role": "user", "content": "Q"}]},
++        {"messages": [{"role": "assistant", "content": ""}]},
++    ],
++)
++def test_bad_chat_rows_rejected(args, row):
++    args.train_data[0].write_text(json.dumps(row) + "\n")
++    with pytest.raises(ValueError):
++        healing.validate_inputs(args)
++
++
++def test_empty_file_rejected(args):
++    args.train_data[0].write_text("")
++    with pytest.raises(ValueError, match="empty"):
++        healing.validate_inputs(args)
++
++
++def test_stripped_mtp_metadata_rejected(args):
++    path = args.pretrained_checkpoint / "config.json"
++    config = json.loads(path.read_text())
++    config["num_nextn_predict_layers"] = 0
++    path.write_text(json.dumps(config))
++    with pytest.raises(ValueError, match="no MTP head"):
++        healing.validate_inputs(args)
++
++
++@pytest.mark.parametrize(
++    "field,value",
++    [
++        ("ep", 3),
++        ("cp", 0),
++        ("seq_length", 123),
++        ("lr", float("nan")),
++        ("warmup_iters", 1000),
++        ("micro_batch_size", 0),
++    ],
++)
++def test_invalid_training_controls_rejected(args, field, value):
++    assert hasattr(args, field)
++    setattr(args, field, value)
++    with pytest.raises(ValueError):
++        healing.validate_inputs(args)
++
++
++def test_two_node_batch_layout(args, monkeypatch):
++    monkeypatch.setenv("WORLD_SIZE", "16")
++    assert healing.validate_inputs(args) == 1
++    args.global_batch_size = 17
++    with pytest.raises(ValueError, match="DP"):
++        healing.validate_inputs(args)
++
++
++def test_invalid_expert_mesh_rejected(args, monkeypatch):
++    monkeypatch.setenv("WORLD_SIZE", "8")
++    with pytest.raises(ValueError, match="WORLD_SIZE"):
++        healing.validate_inputs(args)
++
++
++def test_resume_must_be_explicit_and_native(args):
++    checkpoint = args.output_dir / "checkpoints"
++    checkpoint.mkdir(parents=True)
++    with pytest.raises(ValueError, match="not empty"):
++        healing.validate_inputs(args)
++    args.resume = True
++    with pytest.raises(ValueError, match="latest_checkpointed_iteration"):
++        healing.validate_inputs(args)
++    (checkpoint / "latest_checkpointed_iteration.txt").write_text("10")
++    assert healing.validate_inputs(args) == 1
++
++
++def _context(*, base_grad=False, mtp_grad=True, router_frozen=True):
++    base = Mock(requires_grad=base_grad)
++    base.numel.return_value = 10
++    mtp = Mock(requires_grad=mtp_grad)
++    mtp.numel.return_value = 2
++    chunk = Mock()
++    chunk.named_parameters.return_value = [
++        ("module.decoder.weight", base),
++        ("module.mtp.layers.0.weight", mtp),
++    ]
++    chunk.named_modules.return_value = [
++        ("module.decoder.router", SimpleNamespace(expert_bias=object(), frozen_expert_bias=router_frozen))
++    ]
++    return SimpleNamespace(model=[chunk])
++
++
++def test_runtime_freeze_guard_accepts_wrapped_names():
++    healing.verify_mtp_only(_context())
++
++
++@pytest.mark.parametrize("kwargs", [{"base_grad": True}, {"mtp_grad": False}, {"router_frozen": False}])
++def test_runtime_freeze_guard_catches_backbone_or_router_updates(kwargs):
++    with pytest.raises(RuntimeError):
++        healing.verify_mtp_only(_context(**kwargs))
+diff --git a/tests/unit_tests/recipes/nemotronh/test_nemotron_3_5_lightning_healing.py b/tests/unit_tests/recipes/nemotronh/test_nemotron_3_5_lightning_healing.py
+new file mode 100644
+index 000000000..4cec0941b
+--- /dev/null
++++ b/tests/unit_tests/recipes/nemotronh/test_nemotron_3_5_lightning_healing.py
+@@ -0,0 +1,57 @@
++"""Recipe contract tests for the CUDA/Megatron Bridge environment."""
++
++from unittest.mock import Mock, patch
++
++import pytest
++
++from megatron.bridge.data.builders import ChatSFTPreprocessingConfig
++from megatron.bridge.recipes.nemotronh import nemotron_3_5_lightning_mtp_healing_config
++from megatron.bridge.recipes.nemotronh.nemotron_3_nano import nemotron_3_5_lightning_pretrain_config
++
++
++pytestmark = pytest.mark.unit
++
++
++def test_healing_imports_custom_metadata_and_freezes_base():
++    provider = nemotron_3_5_lightning_pretrain_config().model
++    bridge = Mock()
++    bridge.to_megatron_provider.return_value = provider
++    with patch(
++        "megatron.bridge.recipes.nemotronh.nemotron_3_5_lightning.AutoBridge.from_hf_pretrained", return_value=bridge
++    ) as load:
++        cfg = nemotron_3_5_lightning_mtp_healing_config(hf_model_path="/checkpoints/post-trained-hf")
++    load.assert_called_once_with("/checkpoints/post-trained-hf")
++    bridge.to_megatron_provider.assert_called_once_with(load_weights=False)
++    assert cfg.model.freeze_base_model_for_mtp
++    assert cfg.model.mtp_detach_heads
++    assert cfg.model.mtp_num_layers == 2
++    assert cfg.model.mtp_use_repeated_layer
++    assert cfg.model.mtp_hybrid_override_pattern == "*E"
++    assert cfg.model.keep_mtp_spec_in_bf16
++    assert cfg.peft is None
++    assert cfg.model.expert_model_parallel_size == 16
++    assert cfg.model.pipeline_model_parallel_size == 1
++    assert cfg.model.moe_token_dispatcher_type == "alltoall"
++    assert cfg.tokenizer.tokenizer_model == "/checkpoints/post-trained-hf"
++    assert cfg.tokenizer.hf_tokenizer_kwargs == {}
++    assert isinstance(cfg.dataset.preprocessing, ChatSFTPreprocessingConfig)
++    assert cfg.dataset.preprocessing.loss_mode == "last_turn"
++    assert not cfg.dataset.enable_in_batch_packing
++    assert cfg.checkpoint.load is None
++    assert cfg.checkpoint.dist_ckpt_strictness == "raise_unexpected"
++
++
++@pytest.mark.parametrize(
++    "field,value", [("mtp_num_layers", 0), ("hidden_size", 4096), ("mtp_use_repeated_layer", False)]
++)
++def test_healing_rejects_incompatible_source(field, value):
++    provider = nemotron_3_5_lightning_pretrain_config().model
++    assert hasattr(provider, field)
++    setattr(provider, field, value)
++    bridge = Mock()
++    bridge.to_megatron_provider.return_value = provider
++    with patch(
++        "megatron.bridge.recipes.nemotronh.nemotron_3_5_lightning.AutoBridge.from_hf_pretrained", return_value=bridge
++    ):
++        with pytest.raises(ValueError):
++            nemotron_3_5_lightning_mtp_healing_config(hf_model_path="/checkpoints/post-trained-hf")

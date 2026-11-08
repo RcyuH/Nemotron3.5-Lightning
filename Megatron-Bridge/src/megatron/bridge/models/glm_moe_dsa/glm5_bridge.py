@@ -1,0 +1,430 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import logging
+from collections.abc import Mapping
+from typing import Any
+
+import torch
+from megatron.core.models.gpt.gpt_model import GPTModel
+from transformers import GlmMoeDsaForCausalLM
+
+from megatron.bridge.models.conversion import quantization_utils
+from megatron.bridge.models.conversion.mapping_registry import MegatronMappingRegistry
+from megatron.bridge.models.conversion.model_bridge import MegatronModelBridge
+from megatron.bridge.models.conversion.param_mapping import (
+    AutoMapping,
+    GatedMLPMapping,
+    QKVMapping,
+)
+from megatron.bridge.models.hf_pretrained.causal_lm import PreTrainedCausalLM
+from megatron.bridge.models.mla_provider import MLAModelProvider
+
+
+logger = logging.getLogger(__name__)
+
+
+def _partition_layer_groups(group_sizes: list[int], num_stages: int) -> list[int]:
+    """Split ordered layer groups into contiguous stages that minimize the largest stage.
+
+    Args:
+        group_sizes: Number of layers in each group, in layer order.
+        num_stages: Number of stages; must not exceed the number of groups.
+
+    Returns:
+        Number of layers in each stage. Every stage receives at least one whole group.
+    """
+
+    def stages_needed(capacity: int) -> int:
+        count, load = 1, 0
+        for size in group_sizes:
+            if load + size > capacity:
+                count, load = count + 1, 0
+            load += size
+        return count
+
+    capacity = max(group_sizes)
+    while stages_needed(capacity) > num_stages:
+        capacity += 1
+
+    stage_sizes: list[int] = []
+    start = 0
+    for stage_index in range(num_stages):
+        # Fill each stage up to the minimal capacity while leaving one group for every later stage.
+        last_start = len(group_sizes) - (num_stages - stage_index - 1)
+        end, load = start + 1, group_sizes[start]
+        while end < last_start and load + group_sizes[end] <= capacity:
+            load += group_sizes[end]
+            end += 1
+        stage_sizes.append(load)
+        start = end
+    return stage_sizes
+
+
+@MegatronModelBridge.register_bridge(
+    source=GlmMoeDsaForCausalLM, target=GPTModel, provider=MLAModelProvider, model_type="glm_moe_dsa"
+)
+class GLM5Bridge(MegatronModelBridge):
+    """
+    Megatron Bridge for the GLM-5 family (MoE + MLA + DSA).
+
+    This bridge handles conversion between HuggingFace GlmMoeDsaForCausalLM
+    and Megatron-Core GPTModel formats. ``zai-org/GLM-5``,
+    ``zai-org/GLM-5.1``, ``zai-org/GLM-5.2``, and ``zai-org/GLM-5.3`` are auto-detected through
+    this bridge, with version-specific DSA settings read from the HF config.
+
+    The architecture uses Multi-Latent Attention (MLA), Dynamic Sparse Attention
+    (DSA) indexer layers, and Mixture-of-Experts (MoE).
+    GLM-5.2/5.3 share the same architecture; GLM-5.3's block-scaled FP8
+    checkpoint weights are dequantized to BF16 on import. This does not cover
+    GLM-5.3-Flash, which uses a different architecture. See the model guides
+    for checkpoint-specific verification and export requirements.
+
+    Example:
+        >>> from megatron.bridge import AutoBridge
+        >>> bridge = AutoBridge.from_hf_pretrained("zai-org/GLM-5.1")
+        >>> provider = bridge.to_megatron_provider()
+    """
+
+    def _should_map_hf_config_field(self, hf_config: Any, hf_name: str, megatron_name: str, value: Any) -> bool:
+        """Return whether an HF config field should be mapped to the Megatron provider."""
+        # Transformers 5.11-5.12 has an upstream GLM config bug: ``GlmMoeDsaConfig`` declares an independent
+        # ``num_experts=256`` default alongside the model's authoritative ``n_routed_experts`` field. The generic
+        # config mapping is first-wins, so that injected default can shadow the checkpoint's routed-expert count.
+        # Transformers 5.13 removed the duplicate field and redirects legacy ``num_experts`` input to
+        # ``n_routed_experts``. Detect the affected config shape instead of version-gating so this compatibility
+        # workaround applies only while both fields exist and does not become the default GLM mapping behavior.
+        if hf_name == "num_experts" and hasattr(hf_config, "num_experts") and hasattr(hf_config, "n_routed_experts"):
+            return False
+        return super()._should_map_hf_config_field(hf_config, hf_name, megatron_name, value)
+
+    def provider_bridge(self, hf_pretrained: PreTrainedCausalLM) -> MLAModelProvider:
+        provider = super().provider_bridge(hf_pretrained)
+        hf_config = hf_pretrained.config
+
+        # Use experimental-attention spec for DSA
+        try:
+            from megatron.core.models.gpt.experimental_attention_variant_module_specs import (
+                get_transformer_block_with_experimental_attention_variant_spec,
+            )
+
+            provider.transformer_layer_spec = get_transformer_block_with_experimental_attention_variant_spec
+        except (ImportError, ModuleNotFoundError):
+            logger.warning("DSA spec not available; falling back to standard GPT decoder block spec.")
+
+        provider.normalization = "RMSNorm"
+        provider.gated_linear_unit = True
+        provider.add_bias_linear = False
+        provider.share_embeddings_and_output_weights = False
+        provider.qk_layernorm = True
+        provider.multi_latent_attention = True
+
+        # Disable MTP (Multi-Token Prediction) by default
+        # HF config has num_nextn_predict_layers=1
+        provider.mtp_num_layers = None
+
+        provider.moe_grouped_gemm = True
+        provider.moe_router_pre_softmax = True
+        provider.moe_token_dispatcher_type = "flex"
+        provider.moe_flex_dispatcher_backend = "hybridep"
+        provider.moe_flex_dispatcher_num_sms = 16
+        provider.moe_permute_fusion_into_hybridep = False
+        provider.moe_router_load_balancing_type = "seq_aux_loss"
+        provider.moe_shared_expert_overlap = True
+        provider.moe_router_score_function = "sigmoid"
+        provider.moe_router_enable_expert_bias = True
+        provider.moe_router_bias_update_rate = 0
+        provider.moe_router_dtype = "fp32"
+        provider.moe_permute_fusion = True
+
+        provider.hidden_dropout = 0.0
+        provider.attention_softmax_in_fp32 = False
+
+        provider.make_vocab_size_divisible_by = 1280
+
+        # GLM5-specific: computed fields not in CONFIG_MAPPING
+        provider.moe_layer_freq = [0] * hf_config.first_k_dense_replace + [1] * (
+            hf_config.num_hidden_layers - hf_config.first_k_dense_replace
+        )
+        provider.moe_shared_expert_intermediate_size = hf_config.moe_intermediate_size * hf_config.n_shared_experts
+        # GlmMoeDsaConfig may normalize qk_rope_head_dim to head_dim while
+        # loading GLM-5.2. Recover the RoPE width from the model's invariant:
+        # total QK width = non-RoPE width + RoPE width.
+        provider.qk_pos_emb_head_dim = hf_config.qk_head_dim - hf_config.qk_nope_head_dim
+
+        # GLM5-specific: rotary_base is nested in rope_parameters
+        provider.rotary_base = hf_config.rope_parameters["rope_theta"]
+        # GLM5 uses default rope (no YaRN scaling)
+        provider.rotary_scaling_factor = 1.0
+        provider.mscale = 1.0
+        provider.mscale_all_dim = 1.0
+        provider.cp_comm_type = "allgather"
+
+        # DSA indexer params
+        provider.experimental_attention_variant = "dsa"
+        provider.dsa_indexer_head_dim = hf_config.index_head_dim
+        provider.dsa_indexer_n_heads = hf_config.index_n_heads
+        provider.dsa_indexer_topk = hf_config.index_topk
+        provider.dsa_indexer_rope_interleaved = hf_config.indexer_rope_interleave
+        provider.dsa_indexer_topk_freq = getattr(hf_config, "index_topk_freq", 1)
+        provider.dsa_indexer_skip_topk_offset = getattr(hf_config, "index_skip_topk_offset", 0)
+        provider.dsa_indexer_rotate_activation = False
+        provider.dsa_indexer_k_norm_epsilon = 1e-6
+        provider.dsa_indexer_loss_coeff = 0.001
+        provider.dsa_indexer_use_sparse_loss = True
+
+        return provider
+
+    def generate_pipeline_layout(self, num_layers: int, pp: int, mtp_layers: int = 0) -> list[list[str]] | None:
+        """Generate a conversion pipeline layout that keeps DSA top-k sharing groups on one stage.
+
+        GLM-5.2 decoder layers reuse the DSA top-k indices computed by an earlier
+        layer (``index_topk_freq`` and ``index_skip_topk_offset`` in the HF config).
+        Megatron-Core rejects a pipeline split that separates a reusing layer from
+        its source, and no uniform split of GLM-5.2's 78 decoder layers satisfies
+        that constraint for PP > 1. The conversion launcher calls this hook so every
+        stage starts on a layer that computes its own top-k indices. Sharing groups
+        are assigned to contiguous stages to minimize the largest stage, with
+        embeddings on the first stage and MTP plus loss on the last stage.
+
+        Args:
+            num_layers: Number of decoder layers.
+            pp: Pipeline parallel size.
+            mtp_layers: Number of MTP layers in the converted model.
+
+        Returns:
+            A flexible pipeline layout with exactly ``pp`` stages, or ``None`` when
+            the checkpoint does not share DSA top-k indices across layers and the
+            default pipeline split applies.
+
+        Raises:
+            ValueError: If ``pp`` exceeds the number of DSA top-k sharing groups.
+        """
+        topk_freq = getattr(self.hf_config, "index_topk_freq", 1)
+        if topk_freq <= 1:
+            return None
+
+        from megatron.core.transformer.experimental_attention_variant.dsa import is_dsa_skip_topk_layer
+
+        skip_topk_offset = getattr(self.hf_config, "index_skip_topk_offset", 0)
+        # Each group starts on a layer that computes top-k indices and includes the layers that reuse them.
+        group_sizes: list[int] = []
+        for layer_number in range(1, num_layers + 1):
+            if is_dsa_skip_topk_layer(layer_number, skip_topk_offset, topk_freq):
+                group_sizes[-1] += 1
+            else:
+                group_sizes.append(1)
+        if pp > len(group_sizes):
+            raise ValueError(
+                f"PP={pp} exceeds the {len(group_sizes)} DSA top-k sharing groups in {num_layers} decoder layers; "
+                "each pipeline stage must start on a layer that computes its own top-k indices."
+            )
+
+        layout = [["decoder"] * stage_size for stage_size in _partition_layer_groups(group_sizes, pp)]
+        layout[0].insert(0, "embedding")
+        layout[-1].extend(["mtp"] * mtp_layers)
+        layout[-1].append("loss")
+        return layout
+
+    def mapping_registry(self) -> MegatronMappingRegistry:
+        param_mappings = {
+            # Embed
+            "embedding.word_embeddings.weight": "model.embed_tokens.weight",
+            # LM Head
+            "decoder.final_layernorm.weight": "model.norm.weight",
+            "output_layer.weight": "lm_head.weight",
+            # Attention layernorm
+            "decoder.layers.*.self_attention.linear_qkv.layer_norm_weight": "model.layers.*.input_layernorm.weight",
+            "decoder.layers.*.input_layernorm.weight": "model.layers.*.input_layernorm.weight",
+            # Attention output
+            "decoder.layers.*.self_attention.linear_proj.weight": "model.layers.*.self_attn.o_proj.weight",
+            # Post-attention layernorm — MoE layers use pre_mlp_layernorm, dense layers use layer_norm_weight
+            "decoder.layers.*.pre_mlp_layernorm.weight": "model.layers.*.post_attention_layernorm.weight",
+            "decoder.layers.*.mlp.linear_fc1.layer_norm_weight": "model.layers.*.post_attention_layernorm.weight",
+            # MLA weights
+            "decoder.layers.*.self_attention.linear_q_down_proj.weight": "model.layers.*.self_attn.q_a_proj.weight",
+            "decoder.layers.*.self_attention.linear_q_up_proj.weight": "model.layers.*.self_attn.q_b_proj.weight",
+            "decoder.layers.*.self_attention.linear_q_up_proj.layer_norm_weight": "model.layers.*.self_attn.q_a_layernorm.weight",
+            "decoder.layers.*.self_attention.q_layernorm.weight": "model.layers.*.self_attn.q_a_layernorm.weight",
+            "decoder.layers.*.self_attention.linear_kv_down_proj.weight": "model.layers.*.self_attn.kv_a_proj_with_mqa.weight",
+            "decoder.layers.*.self_attention.linear_kv_up_proj.weight": "model.layers.*.self_attn.kv_b_proj.weight",
+            "decoder.layers.*.self_attention.linear_kv_up_proj.layer_norm_weight": "model.layers.*.self_attn.kv_a_layernorm.weight",
+            "decoder.layers.*.self_attention.kv_layernorm.weight": "model.layers.*.self_attn.kv_a_layernorm.weight",
+            # For non-MLA attention (fallback)
+            "decoder.layers.*.self_attention.linear_q_proj.weight": "model.layers.*.self_attn.q_proj.weight",
+            # DSA indexer
+            "decoder.layers.*.self_attention.core_attention.indexer.linear_wq_b.weight": "model.layers.*.self_attn.indexer.wq_b.weight",
+            "decoder.layers.*.self_attention.core_attention.indexer.linear_wk.weight": "model.layers.*.self_attn.indexer.wk.weight",
+            "decoder.layers.*.self_attention.core_attention.indexer.k_norm.weight": "model.layers.*.self_attn.indexer.k_norm.weight",
+            "decoder.layers.*.self_attention.core_attention.indexer.k_norm.bias": "model.layers.*.self_attn.indexer.k_norm.bias",
+            "decoder.layers.*.self_attention.core_attention.indexer.linear_weights_proj.weight": "model.layers.*.self_attn.indexer.weights_proj.weight",
+            # Dense MLP
+            "decoder.layers.*.mlp.linear_fc2.weight": "model.layers.*.mlp.down_proj.weight",
+            # MoE router
+            "decoder.layers.*.mlp.router.weight": "model.layers.*.mlp.gate.weight",
+            "decoder.layers.*.mlp.router.expert_bias": "model.layers.*.mlp.gate.e_score_correction_bias",
+            # MoE shared experts
+            "decoder.layers.*.mlp.shared_experts.router.weight": "model.layers.*.mlp.shared_experts.gate.weight",
+            "decoder.layers.*.mlp.shared_experts.linear_fc2.weight": "model.layers.*.mlp.shared_experts.down_proj.weight",
+            # MoE expert weights (per-expert format: experts.N.down_proj)
+            "decoder.layers.*.mlp.experts.linear_fc2.weight*": "model.layers.*.mlp.experts.*.down_proj.weight",
+            "decoder.layers.*.mlp.experts.local_experts.*.linear_fc2.weight": "model.layers.*.mlp.experts.*.down_proj.weight",
+        }
+
+        mapping_list = [AutoMapping(megatron_param=k, hf_param=v) for k, v in param_mappings.items()]
+
+        # Attention (non-MLA fallback: combined QKV)
+        mapping_list.extend(
+            [
+                QKVMapping(
+                    megatron_param="decoder.layers.*.self_attention.linear_qkv.weight",
+                    q="model.layers.*.self_attn.q_proj.weight",
+                    k="model.layers.*.self_attn.k_proj.weight",
+                    v="model.layers.*.self_attn.v_proj.weight",
+                ),
+                QKVMapping(
+                    megatron_param="decoder.layers.*.self_attention.linear_qkv.bias",
+                    q="model.layers.*.self_attn.q_proj.bias",
+                    k="model.layers.*.self_attn.k_proj.bias",
+                    v="model.layers.*.self_attn.v_proj.bias",
+                ),
+                # Dense MLP gate+up → fc1
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.linear_fc1.weight",
+                    gate="model.layers.*.mlp.gate_proj.weight",
+                    up="model.layers.*.mlp.up_proj.weight",
+                ),
+                # Shared expert gate+up → fc1
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.shared_experts.linear_fc1.weight",
+                    gate="model.layers.*.mlp.shared_experts.gate_proj.weight",
+                    up="model.layers.*.mlp.shared_experts.up_proj.weight",
+                ),
+            ]
+        )
+
+        # MoE expert weights (per-expert format: experts.N.gate_proj / up_proj)
+        mapping_list.extend(
+            [
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.experts.linear_fc1.weight*",
+                    gate="model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up="model.layers.*.mlp.experts.*.up_proj.weight",
+                ),
+                GatedMLPMapping(
+                    megatron_param="decoder.layers.*.mlp.experts.local_experts.*.linear_fc1.weight",
+                    gate="model.layers.*.mlp.experts.*.gate_proj.weight",
+                    up="model.layers.*.mlp.experts.*.up_proj.weight",
+                ),
+            ]
+        )
+
+        hf_config = self.hf_config
+        num_mtp_layers = getattr(hf_config, "num_nextn_predict_layers", 0) or 0
+        num_transformer_layers = hf_config.num_hidden_layers
+        for mtp_layer in range(num_mtp_layers):
+            # MTP specific mappings
+            mapping_list.extend(
+                [
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.enorm.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.enorm.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.hnorm.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.hnorm.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.eh_proj.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.eh_proj.weight",
+                    ),
+                    AutoMapping(
+                        megatron_param=f"mtp.layers.{mtp_layer}.final_layernorm.weight",
+                        hf_param=f"model.layers.{mtp_layer + num_transformer_layers}.shared_head.norm.weight",
+                    ),
+                ]
+            )
+
+            for layer_prefix in ("transformer_layer", "mtp_model_layer"):
+                for megatron_param, hf_param in param_mappings.items():
+                    megatron_param = (
+                        megatron_param.replace(".*", f".*.{layer_prefix}", 1)
+                        .replace("decoder", "mtp")
+                        .replace(".*", f".{mtp_layer}", 1)
+                    )
+                    hf_param = hf_param.replace("layers.*", f"layers.{mtp_layer + num_transformer_layers}")
+                    mapping_list.append(AutoMapping(megatron_param=megatron_param, hf_param=hf_param))
+                # Special mappings that require parameter concatenation/transformation
+                mapping_list.extend(
+                    [
+                        QKVMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.self_attention.linear_qkv.weight",
+                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.weight",
+                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.weight",
+                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.weight",
+                        ),
+                        QKVMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.self_attention.linear_qkv.bias",
+                            q=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.q_proj.bias",
+                            k=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.k_proj.bias",
+                            v=f"model.layers.{mtp_layer + num_transformer_layers}.self_attn.v_proj.bias",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.linear_fc1.weight",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.up_proj.weight",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.shared_experts.linear_fc1.weight",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.shared_experts.up_proj.weight",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.linear_fc1.weight*",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
+                        ),
+                        GatedMLPMapping(
+                            megatron_param=f"mtp.layers.{mtp_layer}.{layer_prefix}.mlp.experts.local_experts.*.linear_fc1.weight",
+                            gate=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.gate_proj.weight",
+                            up=f"model.layers.{mtp_layer + num_transformer_layers}.mlp.experts.*.up_proj.weight",
+                        ),
+                    ]
+                )
+
+        return MegatronMappingRegistry(*mapping_list)
+
+    def maybe_modify_loaded_hf_weight(
+        self,
+        hf_param: str | dict[str, str],
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor | dict[str, torch.Tensor]:
+        """Dequantize block-scaled FP8 checkpoint weights during import."""
+        hf_weights = super().maybe_modify_loaded_hf_weight(hf_param, hf_state_dict)
+
+        if isinstance(hf_weights, dict):
+            return {
+                key: self._maybe_dequantize_fp8(tensor, hf_param[key], hf_state_dict)
+                for key, tensor in hf_weights.items()
+            }
+        return self._maybe_dequantize_fp8(hf_weights, hf_param, hf_state_dict)
+
+    @staticmethod
+    def _maybe_dequantize_fp8(
+        weight: torch.Tensor,
+        param_name: str,
+        hf_state_dict: Mapping[str, torch.Tensor],
+    ) -> torch.Tensor:
+        scale_key = param_name + "_scale_inv"
+        return quantization_utils.maybe_dequantize_fp8_blockwise(weight, hf_state_dict.get(scale_key))

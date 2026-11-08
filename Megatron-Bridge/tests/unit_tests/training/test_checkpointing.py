@@ -1,0 +1,6838 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+"""Unit tests for megatron.bridge.training.checkpointing module."""
+
+import os
+import pickle
+import tempfile
+from contextlib import ExitStack, contextmanager
+from functools import partial
+from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import MagicMock, Mock, mock_open, patch
+
+import numpy as np
+import pytest
+import torch
+from megatron.core.dist_checkpointing.mapping import ShardedTensor
+from megatron.core.dist_checkpointing.strategies.torch import (
+    TorchDistLoadShardedStrategy,
+    TorchDistSaveShardedStrategy,
+)
+from megatron.core.msc_utils import MultiStorageClientFeature
+from megatron.core.optimizer import distrib_optimizer
+from nvidia_resiliency_ext.checkpointing.async_ckpt.core import AsyncRequest as NVRxAsyncRequest
+
+from megatron.bridge.training.checkpointing import (
+    _DIRECT_ITERATION_DIR_SENTINEL,
+    DATALOADER_STATE_SUBDIR,
+    CheckpointLoadContext,
+    CheckpointManager,
+    CheckpointSaveContext,
+    CheckpointType,
+    DefaultCheckpointManager,
+    _align_rng_state_sharded_metadata,
+    _build_auto_bridge_for_save,
+    _checkpoint_dp_cp_group,
+    _checkpoint_has_per_dp_rng_states,
+    _clear_auto_bridge_cache,
+    _CpuTorchDistSaveShardedStrategy,
+    _extract_megatron_lm_args_from_state_dict,
+    _generate_model_state_dict,
+    _get_checkpoint_format,
+    _get_non_persistent_iteration,
+    _get_run_config_tp_pp,
+    _has_global_non_persistent_checkpoint,
+    _load_base_checkpoint,
+    _load_checkpoint_from_path,
+    _load_hf_pretrained_checkpoint,
+    _load_model_state_dict,
+    _load_non_persistent_base_checkpoint,
+    _record_dataloader_state_dir,
+    _save_hf_adapter_weights,
+    _save_hf_weights,
+    _select_rng_state,
+    checkpoint_exists,
+    cleanup_old_non_persistent_checkpoint,
+    create_checkpoint_manager,
+    delete_extra_state,
+    ensure_directory_exists,
+    find_checkpoint_rank_0,
+    get_checkpoint_name,
+    get_checkpoint_run_config_filename,
+    get_checkpoint_tracker_filename,
+    get_checkpoint_train_state_filename,
+    get_rng_state,
+    init_checkpointing_context,
+    load_checkpoint,
+    maybe_load_dataloader_state,
+    maybe_save_dataloader_state,
+    read_metadata,
+    save_checkpoint,
+    schedule_async_save,
+)
+from megatron.bridge.training.config import (
+    CheckpointConfig,
+    ConfigContainer,
+    DistributedDataParallelConfig,
+    SchedulerConfig,
+)
+from megatron.bridge.training.state import GlobalState, TrainState
+from megatron.bridge.utils.instantiate_utils import InstantiationException
+
+
+try:
+    from megatron.core.dist_checkpointing.strategies.async_utils import AsyncRequest
+except ModuleNotFoundError:
+    AsyncRequest = None
+
+
+class _DummyClass:
+    save_sharded_modelopt_state = None
+
+
+def test_checkpoint_group_includes_gtp_and_supports_older_collections():
+    replica_group = Mock()
+    distribution_group = Mock()
+    pg = SimpleNamespace(dp_cp=replica_group, dp_cp_gtp_remat=distribution_group)
+    assert _checkpoint_dp_cp_group(pg) is distribution_group
+    pg.dp_cp_gtp_remat = None
+    assert _checkpoint_dp_cp_group(pg) is replica_group
+    del pg.dp_cp_gtp_remat
+    assert _checkpoint_dp_cp_group(pg) is replica_group
+
+
+def test_model_checkpoint_metadata_includes_gtp_without_mutating_caller():
+    pg = SimpleNamespace(dp_cp=Mock(), dp_cp_gtp_remat=Mock())
+    model = [Mock(), Mock()]
+    kwargs = {"metadata": {"other": "preserved"}}
+    _generate_model_state_dict(model, kwargs, pg_collection=pg)
+    assert kwargs == {"metadata": {"other": "preserved"}}
+    for chunk in model:
+        chunk.sharded_state_dict.assert_called_once_with(
+            metadata={"other": "preserved", "dp_cp_group": pg.dp_cp_gtp_remat}
+        )
+
+
+@pytest.mark.parametrize("gtp_axis", ["gtp_remat", "expt_gtp_remat"])
+@pytest.mark.parametrize("random_init", [False, True])
+def test_gtp_rng_streams_are_shards_not_replicas(gtp_axis, random_init):
+    def group(size, rank):
+        return SimpleNamespace(size=lambda: size, rank=lambda: rank)
+
+    pg = SimpleNamespace(
+        pp=group(1, 0),
+        tp=group(1, 0),
+        ep=group(1, 0),
+        dp_cp=group(1, 0),
+        dp_cp_gtp_remat=group(2, 1),
+        gtp_remat=None,
+        expt_gtp_remat=None,
+    )
+    setattr(pg, gtp_axis, group(2, 1))
+    with (
+        patch("torch.cuda.get_rng_state", return_value=torch.tensor([1], dtype=torch.uint8)),
+        patch("megatron.bridge.training.checkpointing.tensor_parallel") as tensor_parallel_mock,
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.all_gather_object") as gather,
+    ):
+        tensor_parallel_mock.get_cuda_rng_tracker.return_value.get_states.return_value = {"tracker": "rank1"}
+        rng = get_rng_state(random_init, "torch_dist", pg_collection=pg)
+    assert rng.global_shape == (1, 1, 2)
+    assert rng.global_offset == (0, 0, 1)
+    assert rng.replica_id == 0
+    if random_init:
+        assert len(rng.data) == 2
+        assert gather.call_args.kwargs["group"] is pg.dp_cp_gtp_remat
+    else:
+        assert rng.data[0]["rng_tracker_states"] == {"tracker": "rank1"}
+        gather.assert_not_called()
+
+
+_dummy_obj = _DummyClass()
+
+
+def _write_dataloader_state_marker(path: str) -> None:
+    """Write a marker if an unsafe deserializer executes a test payload."""
+    Path(path).write_text("dataloader state payload executed")
+
+
+class _MaliciousDataloaderState:
+    """Pickle payload used to verify that dataloader restore blocks arbitrary globals."""
+
+    def __init__(self, marker_path: Path):
+        self.marker_path = marker_path
+
+    def __reduce__(self):
+        return _write_dataloader_state_marker, (str(self.marker_path),)
+
+
+class TestCheckpointUtilities:
+    """Test utility functions for checkpoint management."""
+
+    @pytest.mark.parametrize(
+        "model_config",
+        [
+            {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 2},
+            {"transformer": {"tensor_model_parallel_size": 4, "pipeline_model_parallel_size": 2}},
+        ],
+    )
+    def test_get_run_config_tp_pp_supports_flat_and_hybrid_configs(self, model_config):
+        """Checkpoint parallelism checks support provider and HybridModel layouts."""
+        assert _get_run_config_tp_pp(model_config) == (4, 2)
+
+    @pytest.mark.parametrize(
+        "checkpoints_path,iteration,release,expected",
+        [
+            ("/path/to/checkpoints", 1000, False, "/path/to/checkpoints/iter_0001000"),
+            ("/path/to/checkpoints", 1000, True, "/path/to/checkpoints/release"),
+            ("/base", 0, False, "/base/iter_0000000"),
+        ],
+    )
+    def test_get_checkpoint_name(self, checkpoints_path, iteration, release, expected):
+        """Test checkpoint name generation."""
+        result = get_checkpoint_name(checkpoints_path, iteration, release=release)
+        assert result == expected
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    def test_find_checkpoint_rank_0(self, mock_dist_ckpt):
+        """Test finding distributed checkpoints."""
+        # Test when checkpoint exists
+        mock_dist_ckpt.check_is_distributed_checkpoint.return_value = True
+        result = find_checkpoint_rank_0("/checkpoints", 1000)
+        expected = "/checkpoints/iter_0001000"
+        assert result == expected
+        mock_dist_ckpt.check_is_distributed_checkpoint.assert_called_with(expected)
+
+        # Test when checkpoint doesn't exist
+        mock_dist_ckpt.check_is_distributed_checkpoint.return_value = False
+        result = find_checkpoint_rank_0("/checkpoints", 1000)
+        assert result is None
+
+        # Test release checkpoint
+        mock_dist_ckpt.check_is_distributed_checkpoint.return_value = True
+        result = find_checkpoint_rank_0("/checkpoints", 1000, release=True)
+        expected = "/checkpoints/release"
+        assert result == expected
+
+    @pytest.mark.parametrize(
+        "checkpoints_path,prefix,expected",
+        [
+            ("/checkpoints", None, "/checkpoints/train_state.pt"),
+            ("/checkpoints", "latest", "/checkpoints/latest_train_state.pt"),
+        ],
+    )
+    def test_get_checkpoint_train_state_filename(self, checkpoints_path, prefix, expected):
+        """Test train state filename generation."""
+        result = get_checkpoint_train_state_filename(checkpoints_path, prefix)
+        assert result == expected
+
+    def test_get_checkpoint_run_config_filename(self):
+        """Test run config filename generation."""
+        result = get_checkpoint_run_config_filename("/checkpoints")
+        expected = "/checkpoints/run_config.yaml"
+        assert result == expected
+
+    @patch("megatron.bridge.models.conversion.auto_bridge.AutoBridge.from_hf_pretrained")
+    def test_clear_auto_bridge_cache_resets_cached_bridge(self, mock_from_hf_pretrained):
+        """Test that the AutoBridge cache can be reset between multi-stage runs."""
+        cfg = Mock()
+        cfg.checkpoint.hf_source_path = "/hf/source"
+        cfg.checkpoint.hf_trust_remote_code = False
+        cfg.model.hf_model_id = None
+        cfg.tokenizer.tokenizer_model = None
+
+        first_bridge = Mock(name="first_bridge")
+        second_bridge = Mock(name="second_bridge")
+        mock_from_hf_pretrained.side_effect = [first_bridge, second_bridge]
+
+        _clear_auto_bridge_cache()
+        assert _build_auto_bridge_for_save(cfg) is first_bridge
+        assert _build_auto_bridge_for_save(cfg) is first_bridge
+
+        _clear_auto_bridge_cache()
+        assert _build_auto_bridge_for_save(cfg) is second_bridge
+
+        assert mock_from_hf_pretrained.call_count == 2
+
+    def test_get_checkpoint_tracker_filename(self):
+        """Test tracker filename generation for Megatron-LM compatibility."""
+        result = get_checkpoint_tracker_filename("/checkpoints")
+        expected = "/checkpoints/latest_checkpointed_iteration.txt"
+        assert result == expected
+
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing._build_auto_bridge_for_save")
+    def test_save_hf_weights_rejects_unsupported_bridge_before_writing(self, mock_build_bridge, mock_ensure_dir):
+        state = Mock()
+        state.cfg.peft = None
+        state.cfg.checkpoint.hf_source_path = "/hf/source"
+        bridge = mock_build_bridge.return_value
+        bridge._model_bridge.SUPPORTS_HF_PRETRAINED_EXPORT = False
+
+        with pytest.raises(NotImplementedError, match="standalone Hugging Face"):
+            _save_hf_weights(state, [], "/checkpoints/iter_0000001/hf")
+
+        mock_ensure_dir.assert_not_called()
+        bridge.export_hf_weights.assert_not_called()
+        bridge.hf_pretrained.save_artifacts.assert_not_called()
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.all_reduce")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("builtins.open", create=True)
+    def test_read_metadata_mismatch_warns(
+        self, mock_open, mock_print_rank_0, mock_all_reduce, mock_get_rank, mock_dist_init
+    ):
+        """When iterations differ across ranks, a warning should be printed via print_rank_0."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 0
+        mock_file = mock_open.return_value.__enter__.return_value
+        mock_file.read.return_value = "10"
+
+        # Mock tensor semantics: iters_cuda[0].item() -> 20
+        mock_tensor_item = Mock()
+        mock_tensor_item.item.return_value = 20
+        mock_tensor = Mock()
+        mock_tensor.__getitem__ = Mock(return_value=mock_tensor_item)
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            _ = read_metadata("/path/to/tracker")
+
+        assert mock_print_rank_0.called
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.all_reduce")
+    @patch("builtins.open", create=True)
+    def test_read_metadata_iteration(self, mock_open, mock_all_reduce, mock_get_rank, mock_dist_init):
+        """Test reading iteration from Megatron-LM tracker file."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 0
+        mock_file = mock_open.return_value.__enter__.return_value
+        mock_file.read.return_value = "1000"
+
+        # Mock tensor operations - need to make it subscriptable
+        mock_tensor_item = Mock()
+        mock_tensor_item.item.return_value = 1000
+        mock_tensor = Mock()
+        mock_tensor.__getitem__ = Mock(return_value=mock_tensor_item)  # Make it subscriptable
+
+        with patch("torch.tensor", return_value=mock_tensor):
+            iteration, release = read_metadata("/path/to/tracker")
+
+        assert iteration == 1000
+        assert release is False
+
+    @patch("torch.distributed.is_initialized")
+    @patch("builtins.open", create=True)
+    def test_read_metadata_release(self, mock_open, mock_dist_init):
+        """Test reading release flag from Megatron-LM tracker file."""
+        mock_dist_init.return_value = False  # Simplify by not using distributed
+        mock_file = mock_open.return_value.__enter__.return_value
+        mock_file.read.return_value = "release"
+
+        iteration, release = read_metadata("/path/to/tracker")
+
+        assert iteration == 0
+        assert release is True
+
+    @patch("os.path.exists")
+    @patch("os.path.isfile")
+    def test_checkpoint_exists_fallback(self, mock_isfile, mock_exists):
+        """Test checkpoint existence checking with fallback to Megatron-LM tracker."""
+        # NeMo-LM tracker doesn't exist, but Megatron-LM tracker does
+        mock_exists.return_value = False  # latest_train_state.pt doesn't exist
+        mock_isfile.return_value = True  # latest_checkpointed_iteration.txt exists
+
+        result = checkpoint_exists("/checkpoints")
+        assert result is True
+
+        # Verify both files were checked
+        mock_exists.assert_called_with("/checkpoints/latest_train_state.pt")
+        mock_isfile.assert_called_with("/checkpoints/latest_checkpointed_iteration.txt")
+
+    @patch("os.path.exists")
+    def test_checkpoint_exists_normal(self, mock_exists):
+        """Test checkpoint existence checking for normal checkpoints."""
+        # A parent checkpoint directory does NOT contain iteration-dir markers
+        # (run_config.yaml, train_state.pt, etc.) — only tracker files.
+        _iter_markers = {"run_config.yaml", "train_state.pt", "metadata.json", ".metadata"}
+
+        def parent_dir_exists(path):
+            if os.path.basename(path) in _iter_markers:
+                return False
+            return True
+
+        mock_exists.side_effect = parent_dir_exists
+        result = checkpoint_exists("/checkpoints")
+        assert result is True
+        mock_exists.assert_called_with("/checkpoints/latest_train_state.pt")
+
+        # Test when no checkpoint exists
+        mock_exists.side_effect = None
+        mock_exists.return_value = False
+        with patch("os.path.isfile", return_value=False):
+            result = checkpoint_exists("/checkpoints")
+            assert result is False
+
+        # Test with None path
+        result = checkpoint_exists(None)
+        assert result is False
+
+    @patch("os.makedirs")
+    def test_ensure_directory_exists(self, mock_makedirs):
+        """Test directory creation."""
+        # Test with parent directory
+        ensure_directory_exists("/path/to/file.txt", check_parent=True)
+        mock_makedirs.assert_called_with("/path/to", exist_ok=True)
+
+        # Test with full path as directory
+        ensure_directory_exists("/path/to/dir", check_parent=False)
+        mock_makedirs.assert_called_with("/path/to/dir", exist_ok=True)
+
+    def test_ensure_directory_exists_with_msc_url(self):
+        """Test directory creation with MSC URL."""
+        MultiStorageClientFeature.enable()
+
+        # Verify that the parent directory is created
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ensure_directory_exists(f"msc://default{temp_dir}/checkpoints/iter_0000001", check_parent=True)
+            assert os.path.exists(f"{temp_dir}/checkpoints")
+
+            ensure_directory_exists(f"msc://default{temp_dir}/checkpoints/iter_0000001", check_parent=False)
+            assert os.path.exists(f"{temp_dir}/checkpoints/iter_0000001")
+
+
+class TestCheckpointTypes:
+    """Test CheckpointType enum and related logic."""
+
+    def test_checkpoint_type_enum(self):
+        """Test CheckpointType enum values."""
+        assert len(CheckpointType) == 3
+        assert CheckpointType.LOCAL in CheckpointType
+        assert CheckpointType.GLOBAL in CheckpointType
+        assert CheckpointType.FSDP_DTENSOR in CheckpointType
+
+
+class TestRNGState:
+    """Test RNG state collection."""
+
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.cuda.get_rng_state")
+    @patch("torch.get_rng_state")
+    @patch("numpy.random.get_state")
+    @patch("random.getstate")
+    def test_get_rng_state(self, mock_random, mock_np, mock_torch, mock_cuda, mock_dist_init, mock_tp):
+        """Test RNG state collection."""
+        # Setup mocks
+        mock_dist_init.return_value = False
+        mock_random.return_value = "random_state"
+        mock_np.return_value = "np_state"
+        mock_torch.return_value = torch.tensor([1, 2, 3])
+        mock_cuda.return_value = torch.tensor([4, 5, 6])
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 1
+        mock_pg_collection.ep.size.return_value = 1  # EP = 1 (no expert parallelism)
+
+        result = get_rng_state(
+            data_parallel_random_init=False, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        # Verify the result is a ShardedObject
+        assert result.key == "rng_state"
+        assert len(result.data) == 1
+
+        # Verify RNG state structure
+        rng_state = result.data[0]
+        assert rng_state["random_rng_state"] == "random_state"
+        assert rng_state["np_rng_state"] == "np_state"
+        assert rng_state["rng_tracker_states"] == "tracker_states"
+
+    def test_get_rng_state_gathers_requested_dp_streams(self):
+        """Checkpoint every DP RNG stream when the caller requests per-rank state."""
+        pg_collection = Mock()
+        pg_collection.gtp_remat = None
+        pg_collection.expt_gtp_remat = None
+        pg_collection.dp_cp_gtp_remat = None
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.dp_cp.rank.return_value = 0
+        pg_collection.dp_cp.size.return_value = 2
+        pg_collection.ep.size.return_value = 1
+        tracker = Mock()
+        tracker.get_states.return_value = {"model-parallel-rng": torch.tensor([1], dtype=torch.uint8)}
+
+        def gather(states, local_state, group):
+            assert group is pg_collection.dp_cp
+            states[:] = [local_state, {"rank": 1}]
+
+        with (
+            patch("random.getstate", return_value="random_state"),
+            patch("numpy.random.get_state", return_value="numpy_state"),
+            patch("torch.get_rng_state", return_value=torch.tensor([1], dtype=torch.uint8)),
+            patch("torch.cuda.get_rng_state", return_value=torch.tensor([2], dtype=torch.uint8)),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.all_gather_object", side_effect=gather) as all_gather,
+            patch(
+                "megatron.bridge.training.checkpointing.tensor_parallel.get_cuda_rng_tracker",
+                return_value=tracker,
+            ),
+        ):
+            result = get_rng_state(
+                data_parallel_random_init=True,
+                ckpt_format="torch_dist",
+                pg_collection=pg_collection,
+            )
+
+        all_gather.assert_called_once()
+        assert len(result.data) == 2
+        assert result.data[1] == {"rank": 1}
+
+    @pytest.mark.parametrize(
+        ("run_config", "expected"),
+        [
+            ({}, False),
+            ({"rng": {"data_parallel_random_init": True}}, True),
+            ({"checkpoint": {"save_rng_state_per_dp_rank": True}}, True),
+        ],
+    )
+    def test_checkpoint_has_per_dp_rng_states(self, run_config, expected):
+        """Recognize new and legacy per-DP RNG checkpoint metadata."""
+        assert _checkpoint_has_per_dp_rng_states(run_config) is expected
+
+    @pytest.mark.parametrize("with_gtp", [False, True])
+    def test_select_rng_state_uses_saved_layout(self, with_gtp):
+        """Restore saved rank-local streams across DP/CP and GTP layouts."""
+        pg_collection = SimpleNamespace(
+            dp_cp=SimpleNamespace(rank=lambda: 1),
+            dp_cp_gtp_remat=SimpleNamespace(rank=lambda: 2) if with_gtp else None,
+        )
+        states = [{"rank": 0}, {"rank": 1}, {"rank": 2}]
+
+        assert _select_rng_state(states, False, pg_collection) == {"rank": 0}
+        assert _select_rng_state(states, True, pg_collection) == {"rank": 2 if with_gtp else 1}
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_size")
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.cuda.get_rng_state")
+    @patch("torch.get_rng_state")
+    @patch("numpy.random.get_state")
+    @patch("random.getstate")
+    def test_get_rng_state_with_expert_parallelism(
+        self, mock_random, mock_np, mock_torch, mock_cuda, mock_dist_init, mock_tp, mock_get_pg_size
+    ):
+        """Test RNG state collection with Expert Parallelism (EP > 1).
+
+        When EP > 1, RNG state should be sharded by (PP, TP, DP) dimensions
+        with replica_id=0, since different EP ranks may have different RNG states.
+        """
+        # Setup mocks
+        mock_dist_init.return_value = False
+        mock_random.return_value = "random_state"
+        mock_np.return_value = "np_state"
+        mock_torch.return_value = torch.tensor([1, 2, 3])
+        mock_cuda.return_value = torch.tensor([4, 5, 6])
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Mock get_pg_size to return EP size > 1
+        mock_get_pg_size.return_value = 8  # EP > 1
+
+        # Create mock pg_collection with EP > 1 configuration
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.pp.rank.return_value = 1
+        mock_pg_collection.pp.size.return_value = 2
+        mock_pg_collection.tp.rank.return_value = 3
+        mock_pg_collection.tp.size.return_value = 4
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 5
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 6
+
+        result = get_rng_state(
+            data_parallel_random_init=False, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        # RNG layout does not depend on EP.
+        mock_get_pg_size.assert_not_called()
+
+        # Verify the result is a ShardedObject with correct sharding
+        assert result.key == "rng_state"
+        # Shape should be (pp_size, tp_size, dp_size) when EP > 1
+        assert result.global_shape == (2, 4, 6)
+        # Global offset should include dp_rank
+        assert result.global_offset == (1, 3, 5)
+        # replica_id should be 0 (not dp_rank) when EP > 1
+        assert result.replica_id == 0
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_size")
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.cuda.get_rng_state")
+    @patch("torch.get_rng_state")
+    @patch("numpy.random.get_state")
+    @patch("random.getstate")
+    def test_get_rng_state_without_expert_parallelism(
+        self, mock_random, mock_np, mock_torch, mock_cuda, mock_dist_init, mock_tp, mock_get_pg_size
+    ):
+        """Test RNG state collection without Expert Parallelism (EP = 1).
+
+        When EP = 1, RNG state should be sharded by (PP, TP) dimensions
+        with a separate DP/CP coordinate even without expert parallelism.
+        """
+        # Setup mocks
+        mock_dist_init.return_value = False
+        mock_random.return_value = "random_state"
+        mock_np.return_value = "np_state"
+        mock_torch.return_value = torch.tensor([1, 2, 3])
+        mock_cuda.return_value = torch.tensor([4, 5, 6])
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Mock get_pg_size to return EP size = 1
+        mock_get_pg_size.return_value = 1  # EP = 1
+
+        # Create mock pg_collection with EP = 1 configuration
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.pp.rank.return_value = 1
+        mock_pg_collection.pp.size.return_value = 2
+        mock_pg_collection.tp.rank.return_value = 3
+        mock_pg_collection.tp.size.return_value = 4
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 5
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 6
+
+        result = get_rng_state(
+            data_parallel_random_init=False, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        # RNG layout does not depend on EP.
+        mock_get_pg_size.assert_not_called()
+
+        # Verify the result is a ShardedObject with correct sharding
+        assert result.key == "rng_state"
+        # Ordinary DP ranks need separate RNG shards too.
+        assert result.global_shape == (2, 4, 6)
+        # Global offset includes the DP/CP rank.
+        assert result.global_offset == (1, 3, 5)
+        # Each RNG shard has a single owner.
+        assert result.replica_id == 0
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_size")
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.cuda.get_rng_state")
+    @patch("torch.get_rng_state")
+    @patch("numpy.random.get_state")
+    @patch("random.getstate")
+    def test_get_rng_state_with_none_ep_group(
+        self, mock_random, mock_np, mock_torch, mock_cuda, mock_dist_init, mock_tp, mock_get_pg_size
+    ):
+        """Test RNG state collection when EP group is None (not initialized).
+
+        When pg_collection.ep is None, get_pg_size returns 1, so this should
+        preserve each data rank in its own shard, as with an explicit EP group.
+        """
+        # Setup mocks
+        mock_dist_init.return_value = False
+        mock_random.return_value = "random_state"
+        mock_np.return_value = "np_state"
+        mock_torch.return_value = torch.tensor([1, 2, 3])
+        mock_cuda.return_value = torch.tensor([4, 5, 6])
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Mock get_pg_size to return 1 (what it does for None groups)
+        mock_get_pg_size.return_value = 1
+
+        # Create mock pg_collection with ep=None
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 2
+        mock_pg_collection.tp.rank.return_value = 1
+        mock_pg_collection.tp.size.return_value = 4
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 3
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 4
+        mock_pg_collection.ep = None  # Explicitly None
+
+        result = get_rng_state(
+            data_parallel_random_init=False, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+        )
+
+        # RNG layout does not require an EP group.
+        mock_get_pg_size.assert_not_called()
+
+        # Verify the result is a ShardedObject with correct sharding (same as EP=1)
+        assert result.key == "rng_state"
+        assert result.global_shape == (2, 4, 4)
+        assert result.global_offset == (0, 1, 3)
+        assert result.replica_id == 0
+
+
+class TestDeleteExtraState:
+    """Tests for delete_extra_state utility added for cleanup of extraneous keys."""
+
+    def test_delete_extra_state_with_model_section(self):
+        sd = {"model": {"layer.weight": 1, "te_extra_state": 2, "_extra_state.foo": 3}}
+        result = delete_extra_state(sd)
+        assert "te_extra_state" not in result["model"]
+        assert "_extra_state.foo" not in result["model"]
+        assert result["model"]["layer.weight"] == 1
+
+    def test_delete_extra_state_direct_model_state(self):
+        sd = {"layer.weight": 1, "something_extra_state": 2}
+        result = delete_extra_state(sd)
+        assert "something_extra_state" not in result
+        assert result["layer.weight"] == 1
+
+    def test_delete_extra_state_non_mapping_noop(self):
+        class NotMapping:
+            pass
+
+        # Should not throw and should return the original object wrapper
+        sd = {"model": NotMapping()}
+        result = delete_extra_state(sd)
+        assert result is sd
+
+
+@pytest.fixture
+def save_checkpoint_fixtures():
+    """Fixture for save checkpoint tests."""
+    mock_state = Mock(spec=GlobalState)
+    mock_state.train_state = Mock(spec=TrainState)
+    mock_state.train_state.step = 1000
+    # Make state_dict() return a real dictionary that supports item assignment
+    mock_state.train_state.state_dict.return_value = {
+        "step": torch.tensor(1000),
+        "floating_point_operations_so_far": torch.tensor(500000, dtype=torch.float32),
+    }
+    mock_state.rank_monitor_client = Mock()  # Add missing attribute for fault tolerance
+
+    mock_cfg = Mock(spec=ConfigContainer)
+    mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+    mock_cfg.checkpoint.save = "/checkpoints"
+    mock_cfg.checkpoint.async_save = False
+    mock_cfg.checkpoint.save_optim = True
+    mock_cfg.checkpoint.save_rng = True
+    mock_cfg.checkpoint.ckpt_format = "torch_dist"
+    mock_cfg.checkpoint.non_persistent_ckpt_type = "global"
+    mock_cfg.checkpoint.save_tokenizer_assets = False  # Disable for unit tests
+    mock_cfg.checkpoint.also_save_hf_checkpoint = False
+
+    # Create nested mock attributes
+    mock_cfg.optimizer = Mock()
+    mock_cfg.optimizer.use_distributed_optimizer = False
+    mock_cfg.rng = Mock()
+    mock_cfg.rng.data_parallel_random_init = False
+    mock_cfg.dataset = Mock()
+    mock_cfg.dataset.dataloader_save = None
+    mock_cfg.dataset.tokenizer = None  # No tokenizer in unit tests
+    mock_cfg.peft = None
+    mock_cfg.to_yaml = Mock()  # Mock config YAML export
+    mock_cfg.logger = Mock()
+    mock_cfg.logger.log_progress = False
+    mock_cfg.dist = Mock()
+    mock_cfg.dist.use_decentralized_pg = False
+    mock_cfg.ddp = Mock()
+    mock_cfg.ddp.use_megatron_fsdp = False
+
+    mock_state.cfg = mock_cfg
+
+    mock_model = [Mock()]
+    mock_optimizer = Mock()
+    mock_scheduler = Mock()
+
+    return {
+        "mock_state": mock_state,
+        "mock_cfg": mock_cfg,
+        "mock_model": mock_model,
+        "mock_optimizer": mock_optimizer,
+        "mock_scheduler": mock_scheduler,
+    }
+
+
+class TestSaveCheckpoint:
+    """Test checkpoint saving functionality."""
+
+    def test_metadata_failure_does_not_publish_incomplete_checkpoint(self, tmp_path, save_checkpoint_fixtures):
+        """A failed metadata write must leave automatic resume on the previous checkpoint."""
+        state = save_checkpoint_fixtures["mock_state"]
+        state.cfg.checkpoint.save = str(tmp_path)
+        state.cfg.checkpoint.most_recent_k = -1
+        state.cfg.to_yaml.side_effect = OSError("metadata write failed")
+
+        previous_state = TrainState(step=500)
+        latest_train_state = tmp_path / "latest_train_state.pt"
+        torch.save(previous_state.state_dict(), latest_train_state)
+        legacy_tracker = tmp_path / "latest_checkpointed_iteration.txt"
+        legacy_tracker.write_text("500")
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", return_value=None),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("torch.distributed.is_initialized", return_value=False),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            with pytest.raises(OSError, match="metadata write failed"):
+                save_checkpoint(
+                    state,
+                    save_checkpoint_fixtures["mock_model"],
+                    save_checkpoint_fixtures["mock_optimizer"],
+                    save_checkpoint_fixtures["mock_scheduler"],
+                    1000000,
+                    checkpointing_context={},
+                    pg_collection=pg_collection,
+                )
+
+        assert torch.load(latest_train_state, weights_only=True)["step"].item() == 500
+        assert legacy_tracker.read_text() == "500"
+
+    @pytest.mark.parametrize("save_rng", [True, False])
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("torch.save")
+    @patch("shutil.copy")
+    @patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.fault_tolerance")
+    @patch("megatron.bridge.training.checkpointing.is_empty_async_queue")
+    @patch("megatron.bridge.training.checkpointing.get_rank_safe")
+    @patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.barrier")
+    def test_save_checkpoint_global(
+        self,
+        mock_barrier,
+        mock_get_dist_rank,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_strategy_cls,
+        mock_ensure_dir,
+        mock_save_dataloader,
+        mock_get_rank_safe,
+        mock_empty_queue,
+        mock_ft,
+        mock_get_pg_collection,
+        mock_dist_ckpt,
+        mock_gen_state,
+        mock_rerun,
+        mock_get_rng,
+        mock_unwrap,
+        mock_save_modelopt,
+        mock_shutil_copy,
+        mock_torch_save,
+        mock_file_open,
+        mock_is_last_rank,
+        mock_wandb,
+        save_checkpoint_fixtures,
+        save_rng,
+    ):
+        """Test saving a global checkpoint."""
+        # Setup mocks
+        mock_dist_init.return_value = True
+        mock_get_dist_rank.return_value = 0
+        mock_get_rank_safe.return_value = 0
+        mock_empty_queue.return_value = True
+        mock_unwrap.return_value = save_checkpoint_fixtures["mock_model"]
+        mock_get_rng.return_value = Mock()
+        mock_rerun.return_value.state_dict.return_value = {}
+        mock_gen_state.return_value = {"model": {"param1": "value1", "param2": "value2"}}
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.expt_dp.rank.return_value = 0
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.save.return_value = None  # Synchronous save
+        mock_save_modelopt.return_value = None  # Mock ModelOpt save
+        mock_is_last_rank.return_value = False  # Disable wandb logging for simplicity
+        mock_torch_save.return_value = None  # Mock file save
+        mock_shutil_copy.return_value = None  # Mock file copy
+
+        # Add wandb logger to state
+        save_checkpoint_fixtures["mock_state"].wandb_logger = Mock()
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.most_recent_k = -1
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.save_rng = save_rng
+
+        call_order = Mock()
+        call_order.attach_mock(mock_dist_ckpt.save, "model")
+        call_order.attach_mock(mock_save_dataloader, "loader")
+
+        # Call save_checkpoint
+        save_checkpoint(
+            save_checkpoint_fixtures["mock_state"],
+            save_checkpoint_fixtures["mock_model"],
+            save_checkpoint_fixtures["mock_optimizer"],
+            save_checkpoint_fixtures["mock_scheduler"],
+            1000000,
+            checkpointing_context={},
+            non_persistent_ckpt=False,
+        )
+
+        assert [call[0] for call in call_order.mock_calls] == ["model", "loader"]
+
+        # Verify calls
+        mock_ft.on_checkpointing_start.assert_called_once()
+        mock_gen_state.assert_called_once()
+        mock_dist_ckpt.save.assert_called_once()
+        if save_rng:
+            mock_get_rng.assert_called_once()
+        else:
+            mock_get_rng.assert_not_called()
+        assert mock_gen_state.call_args.args[4] is (mock_get_rng.return_value if save_rng else None)
+
+        # Verify that the tracker file was written with the correct iteration
+        tracker_calls = [
+            call
+            for call in mock_file_open.call_args_list
+            if len(call[0]) > 0 and "latest_checkpointed_iteration.txt" in call[0][0]
+        ]
+        assert len(tracker_calls) > 0, "Tracker file should be written"
+
+        # Verify the iteration was written to the file
+        mock_file_handle = mock_file_open()
+        write_calls = [call for call in mock_file_handle.write.call_args_list]
+        assert len(write_calls) > 0, "Should write iteration to tracker file"
+        # Check that the iteration (1000) was written
+        written_content = "".join([str(call[0][0]) for call in write_calls if len(call[0]) > 0])
+        assert "1000" in written_content, f"Expected '1000' in written content, got: {written_content}"
+
+    def test_cpu_torch_dist_strategy_roundtrip_without_cuda(self, tmp_path):
+        """CPU checkpoint conversion must save and reload real tensor values."""
+        if torch.distributed.is_initialized():
+            pytest.skip("Requires an isolated CPU process group")
+        torch.distributed.init_process_group("gloo", store=torch.distributed.HashStore(), rank=0, world_size=1)
+        expected = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+        try:
+            with (
+                patch("torch.cuda.is_available", return_value=False),
+                patch("torch.cuda.synchronize", side_effect=AssertionError("CPU save must not synchronize CUDA")),
+            ):
+                _CpuTorchDistSaveShardedStrategy().save(
+                    {"weight": ShardedTensor.from_rank_offsets("weight", expected)}, tmp_path
+                )
+                loaded = TorchDistLoadShardedStrategy().load(
+                    {"weight": ShardedTensor.from_rank_offsets("weight", torch.empty_like(expected))}, tmp_path
+                )
+            torch.testing.assert_close(loaded["weight"], expected)
+        finally:
+            torch.distributed.destroy_process_group()
+
+    @pytest.mark.skipif(AsyncRequest is None, reason="Legacy MCore async implementation is not present")
+    def test_cpu_torch_dist_strategy_uses_blocking_preload(self, tmp_path):
+        """CPU checkpoint staging must not synchronize an unavailable CUDA device."""
+        preload_modes = []
+        written_buckets = []
+        finalize_devices = []
+
+        def preload(write_buckets, non_blocking=True):
+            preload_modes.append(non_blocking)
+            return write_buckets
+
+        def write(_rank, write_buckets, _results_queue):
+            written_buckets.extend(write_buckets)
+
+        request = AsyncRequest(
+            async_fn=write,
+            async_fn_args=(0, None, None),
+            finalize_fns=[lambda: finalize_devices.append(torch.cuda.current_device())],
+            preload_fn=partial(preload, ["cpu-tensor"], True),
+        )
+        strategy = _CpuTorchDistSaveShardedStrategy()
+        original_current_device = torch.cuda.current_device
+
+        with (
+            patch.object(TorchDistSaveShardedStrategy, "async_save", return_value=request, autospec=True),
+            patch("torch.distributed.barrier"),
+        ):
+            strategy.save({}, tmp_path)
+
+        assert preload_modes == [False]
+        assert written_buckets == ["cpu-tensor"]
+        assert finalize_devices == [torch.device("cpu")]
+        assert torch.cuda.current_device is original_current_device
+
+    def test_cpu_torch_dist_strategy_preserves_cuda_finalize_for_nccl(self):
+        """NCCL cannot broadcast MCore's final status tensor from the CPU."""
+        finalize_devices = []
+
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_backend", return_value="nccl"),
+            patch("torch.cuda.current_device", return_value=3),
+        ):
+            _CpuTorchDistSaveShardedStrategy._run_finalize(
+                lambda: finalize_devices.append(torch.cuda.current_device())
+            )
+
+        assert finalize_devices == [3]
+
+    def test_async_retention_keeps_tracker_checkpoint_until_finalize(self, tmp_path, save_checkpoint_fixtures):
+        """The tracker-selected checkpoint must survive until its async replacement is durable."""
+        old_checkpoint = tmp_path / "iter_0000500"
+        current_checkpoint = tmp_path / "iter_0001000"
+        future_incomplete_checkpoint = tmp_path / "iter_0001500"
+        old_checkpoint.mkdir()
+        torch.save({"step": torch.tensor(500)}, old_checkpoint / "train_state.pt")
+        latest_train_state = tmp_path / "latest_train_state.pt"
+        torch.save({"step": torch.tensor(500)}, latest_train_state)
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.cfg.checkpoint.save = str(tmp_path)
+        state.cfg.checkpoint.async_save = True
+        state.cfg.checkpoint.most_recent_k = 1
+        state.wandb_logger = Mock()
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        finalize_fns = []
+        call_order = []
+        async_request = Mock()
+
+        def add_finalize_fn(finalize_fn):
+            finalize_fns.append(finalize_fn)
+            if finalize_fn.__name__ == "cleanup_old_checkpoints_finalize_fn":
+                call_order.append("register_cleanup")
+
+        async_request.add_finalize_fn.side_effect = add_finalize_fn
+
+        def start_async_save(*args, **kwargs):
+            current_checkpoint.mkdir(exist_ok=True)
+            return async_request
+
+        def run_cleanup_immediately(*, target, args):
+            thread = Mock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", side_effect=start_async_save),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch(
+                "megatron.bridge.training.checkpointing.schedule_async_save",
+                side_effect=lambda *args, **kwargs: call_order.append("schedule"),
+            ),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("megatron.bridge.training.checkpointing.threading.Thread", side_effect=run_cleanup_immediately),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier"),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+            )
+
+            assert call_order == ["register_cleanup", "schedule"]
+            assert old_checkpoint.is_dir()
+            assert current_checkpoint.is_dir()
+            assert torch.load(latest_train_state, weights_only=True)["step"].item() == 500
+
+            # A later save can create its directory before this request finalizes.
+            future_incomplete_checkpoint.mkdir()
+            for finalize_fn in finalize_fns:
+                finalize_fn()
+
+        assert not old_checkpoint.exists()
+        assert current_checkpoint.is_dir()
+        assert future_incomplete_checkpoint.is_dir()
+        assert torch.load(latest_train_state, weights_only=True)["step"].item() == 1000
+
+    @pytest.mark.parametrize(
+        "previous_tracker, previous_checkpoint_name, previous_checkpoint_remains",
+        [
+            ("10", "iter_0000010", False),
+            ("20", "iter_0000020", True),
+            ("release", "release", True),
+        ],
+    )
+    def test_sync_persistent_save_honors_retain_interval(
+        self,
+        tmp_path,
+        save_checkpoint_fixtures,
+        previous_tracker,
+        previous_checkpoint_name,
+        previous_checkpoint_remains,
+    ):
+        """Persistent saves retain only interval checkpoints and the latest checkpoint."""
+        previous_checkpoint = tmp_path / previous_checkpoint_name
+        previous_checkpoint.mkdir()
+        tracker = tmp_path / "latest_checkpointed_iteration.txt"
+        tracker.write_text(previous_tracker)
+        current_checkpoint = tmp_path / "iter_0000030"
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.train_state.step = 30
+        state.train_state.state_dict.return_value = {"step": torch.tensor(30)}
+        state.cfg.checkpoint.save = str(tmp_path)
+        state.cfg.checkpoint.async_save = False
+        state.cfg.checkpoint.save_retain_interval = 20
+        state.cfg.checkpoint.most_recent_k = -1
+        state.wandb_logger = Mock()
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        with (
+            patch(
+                "megatron.bridge.training.checkpointing.dist_checkpointing.save",
+                return_value=None,
+            ),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("torch.distributed.is_initialized", return_value=False),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                pg_collection=pg_collection,
+            )
+
+        assert previous_checkpoint.exists() is previous_checkpoint_remains
+        assert current_checkpoint.is_dir()
+        assert tracker.read_text() == "30"
+
+    def test_async_persistent_save_defers_retain_interval_cleanup(self, tmp_path, save_checkpoint_fixtures):
+        """The previous checkpoint remains available until its async replacement is durable."""
+        previous_checkpoint = tmp_path / "iter_0000010"
+        previous_checkpoint.mkdir()
+        latest_train_state = tmp_path / "latest_train_state.pt"
+        torch.save({"step": torch.tensor(10)}, latest_train_state)
+        (tmp_path / "latest_checkpointed_iteration.txt").write_text("10")
+        current_checkpoint = tmp_path / "iter_0000030"
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.train_state.step = 30
+        state.train_state.state_dict.return_value = {"step": torch.tensor(30)}
+        state.cfg.checkpoint.save = str(tmp_path)
+        state.cfg.checkpoint.async_save = True
+        state.cfg.checkpoint.save_retain_interval = 20
+        state.cfg.checkpoint.most_recent_k = -1
+        state.wandb_logger = Mock()
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        finalize_fns = []
+        async_request = Mock()
+        async_request.add_finalize_fn.side_effect = finalize_fns.append
+
+        def run_cleanup_immediately(*, target):
+            thread = Mock()
+            thread.start.side_effect = target
+            return thread
+
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", return_value=async_request),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.schedule_async_save"),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("megatron.bridge.training.checkpointing.threading.Thread", side_effect=run_cleanup_immediately),
+            patch("torch.distributed.is_initialized", return_value=False),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                pg_collection=pg_collection,
+            )
+
+            assert previous_checkpoint.is_dir()
+            assert torch.load(latest_train_state, weights_only=True)["step"].item() == 10
+            for finalize_fn in finalize_fns:
+                finalize_fn()
+
+        assert not previous_checkpoint.exists()
+        assert current_checkpoint.is_dir()
+        assert torch.load(latest_train_state, weights_only=True)["step"].item() == 30
+
+    def test_async_checkpoint_loggers_use_scheduled_step(self, save_checkpoint_fixtures):
+        """Delayed logger finalizers must identify the checkpoint they belong to."""
+        state = save_checkpoint_fixtures["mock_state"]
+        state.cfg.checkpoint.async_save = True
+        state.cfg.checkpoint.most_recent_k = -1
+        state.cfg.logger.mlflow_log_artifacts = True
+        state.wandb_logger = Mock()
+        state.mlflow_logger = Mock()
+        state.comet_logger = Mock()
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        finalize_fns = []
+        async_request = Mock()
+        async_request.add_finalize_fn.side_effect = finalize_fns.append
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", return_value=async_request)
+            )
+            stack.enter_context(
+                patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock())
+            )
+            stack.enter_context(patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()))
+            mock_rerun = stack.enter_context(patch("megatron.bridge.training.checkpointing.get_rerun_state_machine"))
+            stack.enter_context(
+                patch(
+                    "megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes",
+                    return_value=(None, None),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "megatron.bridge.training.checkpointing.generate_state_dict",
+                    return_value={"model": {"weight": Mock()}},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "megatron.bridge.training.checkpointing.unwrap_model",
+                    return_value=save_checkpoint_fixtures["mock_model"],
+                )
+            )
+            for target in (
+                "save_sharded_modelopt_state",
+                "maybe_save_dataloader_state",
+                "schedule_async_save",
+                "fault_tolerance",
+                "ensure_directory_exists",
+            ):
+                stack.enter_context(patch(f"megatron.bridge.training.checkpointing.{target}"))
+            stack.enter_context(
+                patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True)
+            )
+            stack.enter_context(patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0))
+            mock_wandb = stack.enter_context(patch("megatron.bridge.training.checkpointing.wandb_utils"))
+            mock_mlflow = stack.enter_context(patch("megatron.bridge.training.checkpointing.mlflow_utils"))
+            mock_comet = stack.enter_context(patch("megatron.bridge.training.checkpointing.comet_utils"))
+            stack.enter_context(patch("torch.distributed.is_initialized", return_value=False))
+            stack.enter_context(patch("torch.save"))
+            stack.enter_context(patch("shutil.copy"))
+            stack.enter_context(patch("builtins.open", mock_open()))
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                pg_collection=pg_collection,
+            )
+
+            state.train_state.step = 1001
+            for finalize_fn in finalize_fns:
+                finalize_fn()
+
+        checkpoint_path = "/checkpoints/iter_0001000"
+        mock_wandb.on_save_checkpoint_success.assert_called_once_with(
+            checkpoint_path, "/checkpoints", 1000, wandb_writer=state.wandb_logger
+        )
+        mock_mlflow.on_save_checkpoint_success.assert_called_once_with(
+            checkpoint_path, "/checkpoints", 1000, mlflow_logger=state.mlflow_logger
+        )
+        mock_comet.on_save_checkpoint_success.assert_called_once_with(
+            checkpoint_path, "/checkpoints", 1000, comet_logger=state.comet_logger
+        )
+
+    @pytest.mark.parametrize("most_recent_k", [0, 1])
+    def test_async_global_non_persistent_overlap_preserves_tracker_checkpoint(
+        self, tmp_path, save_checkpoint_fixtures, most_recent_k
+    ):
+        """An incomplete async replacement must not evict the tracker-selected checkpoint."""
+        save_dir = tmp_path / "persistent"
+        non_persistent_dir = tmp_path / "non_persistent"
+        durable_checkpoint = non_persistent_dir / "iter_0000010"
+        incomplete_checkpoint = non_persistent_dir / "iter_0000020"
+        current_checkpoint = non_persistent_dir / "iter_0000030"
+        future_incomplete_checkpoint = non_persistent_dir / "iter_0000040"
+        durable_checkpoint.mkdir(parents=True)
+        incomplete_checkpoint.mkdir()
+        future_incomplete_checkpoint.mkdir()
+        latest_train_state = non_persistent_dir / "latest_train_state.pt"
+        torch.save({"step": torch.tensor(10)}, latest_train_state)
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.train_state.step = 30
+        state.train_state.state_dict.return_value = {"step": torch.tensor(30)}
+        state.cfg.checkpoint.save = str(save_dir)
+        state.cfg.checkpoint.non_persistent_ckpt_type = "global"
+        state.cfg.checkpoint.non_persistent_global_ckpt_dir = str(non_persistent_dir)
+        state.cfg.checkpoint.async_save = True
+        state.cfg.checkpoint.most_recent_k = most_recent_k
+        state.wandb_logger = Mock()
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        finalize_fns = []
+        async_request = Mock()
+        async_request.add_finalize_fn.side_effect = finalize_fns.append
+
+        def run_cleanup_immediately(*, target, args):
+            thread = Mock()
+            thread.start.side_effect = lambda: target(*args)
+            return thread
+
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", return_value=async_request),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.schedule_async_save"),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=False),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("megatron.bridge.training.checkpointing.threading.Thread", side_effect=run_cleanup_immediately),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier"),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                non_persistent_ckpt=True,
+            )
+
+            assert durable_checkpoint.is_dir()
+            assert incomplete_checkpoint.is_dir()
+            assert future_incomplete_checkpoint.is_dir()
+            assert torch.load(latest_train_state, weights_only=True)["step"].item() == 10
+
+            for finalize_fn in finalize_fns:
+                finalize_fn()
+
+        assert not durable_checkpoint.exists()
+        assert not incomplete_checkpoint.exists()
+        assert current_checkpoint.is_dir()
+        assert future_incomplete_checkpoint.is_dir()
+        assert torch.load(latest_train_state, weights_only=True)["step"].item() == 30
+
+    @pytest.mark.parametrize(
+        "most_recent_k, save_retain_interval, expected_steps",
+        [(5, None, (20, 30, 40, 50, 60)), (-1, 20, (50, 60))],
+    )
+    def test_sync_global_non_persistent_honors_configured_retention(
+        self, tmp_path, save_checkpoint_fixtures, most_recent_k, save_retain_interval, expected_steps
+    ):
+        """Synchronous global non-persistent cleanup must retain the configured checkpoint count."""
+        save_dir = tmp_path / "persistent"
+        non_persistent_dir = tmp_path / "non_persistent"
+        checkpoint_steps = (10, 20, 30, 40, 50)
+        for step in checkpoint_steps:
+            (non_persistent_dir / f"iter_{step:07d}").mkdir(parents=True, exist_ok=True)
+        current_checkpoint = non_persistent_dir / "iter_0000060"
+        future_incomplete_checkpoint = non_persistent_dir / "iter_0000070"
+        future_incomplete_checkpoint.mkdir()
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.train_state.step = 60
+        state.train_state.state_dict.return_value = {"step": torch.tensor(60)}
+        state.cfg.checkpoint.save = str(save_dir)
+        state.cfg.checkpoint.non_persistent_ckpt_type = "global"
+        state.cfg.checkpoint.non_persistent_global_ckpt_dir = str(non_persistent_dir)
+        state.cfg.checkpoint.async_save = False
+        state.cfg.checkpoint.most_recent_k = most_recent_k
+        state.cfg.checkpoint.save_retain_interval = save_retain_interval
+        state.wandb_logger = Mock()
+        (non_persistent_dir / "latest_checkpointed_iteration.txt").write_text("50")
+
+        pg_collection = Mock()
+        pg_collection.expt_dp.rank.return_value = 0
+        pg_collection.tp.rank.return_value = 0
+        pg_collection.tp.size.return_value = 1
+        pg_collection.pp.rank.return_value = 0
+        pg_collection.pp.size.return_value = 1
+
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.save", return_value=None),
+            patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_pg_collection", return_value=pg_collection),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value=Mock()),
+            patch("megatron.bridge.training.checkpointing.get_rerun_state_machine") as mock_rerun,
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict",
+                return_value={"model": {"weight": Mock()}},
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state"),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.fault_tolerance"),
+            patch("megatron.bridge.training.checkpointing.is_empty_async_queue", return_value=True),
+            patch("megatron.bridge.training.checkpointing.get_rank_safe", return_value=0),
+            patch("megatron.bridge.training.checkpointing.is_last_rank", return_value=False),
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+            patch("torch.distributed.barrier"),
+        ):
+            mock_rerun.return_value.state_dict.return_value = {}
+            save_checkpoint(
+                state,
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                non_persistent_ckpt=True,
+            )
+
+        actual_steps = {int(checkpoint.name.removeprefix("iter_")) for checkpoint in non_persistent_dir.glob("iter_*")}
+        assert actual_steps == {*expected_steps, 70}
+        assert current_checkpoint.is_dir()
+        assert future_incomplete_checkpoint.is_dir()
+
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("torch.save")
+    @patch("shutil.copy")
+    @patch("megatron.bridge.training.checkpointing.schedule_async_save")
+    @patch("megatron.bridge.training.checkpointing._save_hf_weights")
+    @patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.fault_tolerance")
+    @patch("megatron.bridge.training.checkpointing.is_empty_async_queue")
+    @patch("megatron.bridge.training.checkpointing.get_rank_safe")
+    @patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.barrier")
+    def test_save_checkpoint_hf_exports_extra_weights_without_rewriting_megatron_checkpoint(
+        self,
+        mock_barrier,
+        mock_get_dist_rank,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_strategy_cls,
+        mock_ensure_dir,
+        mock_save_dataloader,
+        mock_get_rank_safe,
+        mock_empty_queue,
+        mock_ft,
+        mock_get_pg_collection,
+        mock_dist_ckpt,
+        mock_gen_state,
+        mock_rerun,
+        mock_get_rng,
+        mock_unwrap,
+        mock_save_modelopt,
+        mock_save_hf_weights,
+        mock_schedule_async_save,
+        mock_shutil_copy,
+        mock_torch_save,
+        mock_file_open,
+        mock_is_last_rank,
+        mock_wandb,
+        save_checkpoint_fixtures,
+    ):
+        """HF weight export should be an extra artifact, not a replacement for Megatron state."""
+        mock_dist_init.return_value = True
+        mock_get_dist_rank.return_value = 0
+        mock_get_rank_safe.return_value = 0
+        mock_empty_queue.return_value = True
+        mock_unwrap.return_value = save_checkpoint_fixtures["mock_model"]
+        mock_get_rng.return_value = Mock()
+        mock_rerun.return_value.state_dict.return_value = {}
+        full_state_dict = {
+            "model": {"param1": "value1"},
+            "optimizer": {"state": "value2"},
+            "rng_state": ["value3"],
+        }
+        mock_gen_state.return_value = full_state_dict
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.expt_dp.rank.return_value = 0
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.save.return_value = None
+        mock_save_modelopt.return_value = None
+        mock_is_last_rank.return_value = False
+        mock_torch_save.return_value = None
+        mock_shutil_copy.return_value = None
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.wandb_logger = Mock()
+        state.cfg.checkpoint.most_recent_k = -1
+        state.cfg.checkpoint.also_save_hf_checkpoint = True
+
+        save_checkpoint(
+            state,
+            save_checkpoint_fixtures["mock_model"],
+            save_checkpoint_fixtures["mock_optimizer"],
+            save_checkpoint_fixtures["mock_scheduler"],
+            1000000,
+            checkpointing_context={},
+            non_persistent_ckpt=False,
+        )
+
+        iter_dir = "/checkpoints/iter_0001000"
+        mock_dist_ckpt.save.assert_called_once()
+        saved_state_dict, save_target = mock_dist_ckpt.save.call_args.args[:2]
+        assert save_target == iter_dir
+        assert "model" in saved_state_dict
+        assert saved_state_dict["model"] == {"param1": "value1"}
+        mock_save_hf_weights.assert_called_once_with(state, save_checkpoint_fixtures["mock_model"], f"{iter_dir}/hf")
+        mock_schedule_async_save.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("torch.save")
+    @patch("shutil.copy")
+    @patch("megatron.bridge.training.checkpointing.schedule_async_save")
+    @patch("megatron.bridge.training.checkpointing._save_hf_weights")
+    @patch("megatron.bridge.training.checkpointing.apply_peft_adapter_filter_to_state_dict")
+    @patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.fault_tolerance")
+    @patch("megatron.bridge.training.checkpointing.is_empty_async_queue")
+    @patch("megatron.bridge.training.checkpointing.get_rank_safe")
+    @patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.barrier")
+    def test_save_checkpoint_peft_hf_keeps_adapter_only_megatron_state_and_exports_hf_sidecar(
+        self,
+        mock_barrier,
+        mock_get_dist_rank,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_strategy_cls,
+        mock_ensure_dir,
+        mock_save_dataloader,
+        mock_get_rank_safe,
+        mock_empty_queue,
+        mock_ft,
+        mock_get_pg_collection,
+        mock_dist_ckpt,
+        mock_gen_state,
+        mock_rerun,
+        mock_get_rng,
+        mock_unwrap,
+        mock_save_modelopt,
+        mock_apply_peft_filter,
+        mock_save_hf_weights,
+        mock_schedule_async_save,
+        mock_shutil_copy,
+        mock_torch_save,
+        mock_file_open,
+        mock_is_last_rank,
+        mock_wandb,
+        save_checkpoint_fixtures,
+    ):
+        """PEFT + HF sidecar should preserve adapter-only Megatron checkpoint behavior."""
+        mock_dist_init.return_value = True
+        mock_get_dist_rank.return_value = 0
+        mock_get_rank_safe.return_value = 0
+        mock_empty_queue.return_value = True
+        mock_unwrap.return_value = save_checkpoint_fixtures["mock_model"]
+        mock_get_rng.return_value = Mock()
+        mock_rerun.return_value.state_dict.return_value = {}
+        full_state_dict = {
+            "model": {
+                "decoder.layers.0.self_attention.linear_qkv.weight": "base",
+                "decoder.layers.0.self_attention.linear_qkv.adapter.weight": "adapter",
+            },
+            "optimizer": {"state": "value2"},
+            "rng_state": ["value3"],
+        }
+        filtered_state_dict = {
+            "model": {
+                "decoder.layers.0.self_attention.linear_qkv.adapter.weight": "adapter",
+            },
+            "optimizer": {"state": "value2"},
+            "rng_state": ["value3"],
+        }
+        mock_gen_state.return_value = full_state_dict
+        mock_apply_peft_filter.return_value = filtered_state_dict
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.expt_dp.rank.return_value = 0
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.save.return_value = None
+        mock_save_modelopt.return_value = None
+        mock_is_last_rank.return_value = False
+        mock_torch_save.return_value = None
+        mock_shutil_copy.return_value = None
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.wandb_logger = Mock()
+        state.cfg.peft = Mock()
+        state.cfg.checkpoint.most_recent_k = -1
+        state.cfg.checkpoint.also_save_hf_checkpoint = True
+
+        save_checkpoint(
+            state,
+            save_checkpoint_fixtures["mock_model"],
+            save_checkpoint_fixtures["mock_optimizer"],
+            save_checkpoint_fixtures["mock_scheduler"],
+            1000000,
+            checkpointing_context={},
+            non_persistent_ckpt=False,
+        )
+
+        iter_dir = "/checkpoints/iter_0001000"
+        mock_apply_peft_filter.assert_called_once_with(full_state_dict, state.cfg.peft)
+        mock_dist_ckpt.save.assert_called_once()
+        saved_state_dict, save_target = mock_dist_ckpt.save.call_args.args[:2]
+        assert save_target == iter_dir
+        assert saved_state_dict == filtered_state_dict
+        assert "decoder.layers.0.self_attention.linear_qkv.weight" not in saved_state_dict["model"]
+        mock_save_hf_weights.assert_called_once_with(state, save_checkpoint_fixtures["mock_model"], f"{iter_dir}/hf")
+        mock_schedule_async_save.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("torch.save")
+    @patch("shutil.copy")
+    @patch("megatron.bridge.training.checkpointing.schedule_async_save")
+    @patch("megatron.bridge.training.checkpointing._save_hf_weights")
+    @patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.fault_tolerance")
+    @patch("megatron.bridge.training.checkpointing.is_empty_async_queue")
+    @patch("megatron.bridge.training.checkpointing.get_rank_safe")
+    @patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.barrier")
+    def test_save_checkpoint_async_hf_schedules_megatron_before_hf_export(
+        self,
+        mock_barrier,
+        mock_get_dist_rank,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_strategy_cls,
+        mock_ensure_dir,
+        mock_save_dataloader,
+        mock_get_rank_safe,
+        mock_empty_queue,
+        mock_ft,
+        mock_get_pg_collection,
+        mock_dist_ckpt,
+        mock_gen_state,
+        mock_rerun,
+        mock_get_rng,
+        mock_unwrap,
+        mock_save_modelopt,
+        mock_save_hf_weights,
+        mock_schedule_async_save,
+        mock_shutil_copy,
+        mock_torch_save,
+        mock_file_open,
+        mock_is_last_rank,
+        mock_wandb,
+        save_checkpoint_fixtures,
+    ):
+        """Async Megatron checkpoint I/O should be scheduled before extra HF export starts."""
+        call_order = []
+
+        mock_dist_init.return_value = True
+        mock_get_dist_rank.return_value = 0
+        mock_get_rank_safe.return_value = 0
+        mock_empty_queue.return_value = True
+        mock_unwrap.return_value = save_checkpoint_fixtures["mock_model"]
+        mock_get_rng.return_value = Mock()
+        mock_rerun.return_value.state_dict.return_value = {}
+        mock_gen_state.return_value = {
+            "model": {"param1": "value1"},
+            "optimizer": {"state": "value2"},
+            "rng_state": ["value3"],
+        }
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.expt_dp.rank.return_value = 0
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        async_request = Mock()
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.save.return_value = async_request
+        mock_save_modelopt.return_value = None
+        mock_is_last_rank.return_value = False
+        mock_torch_save.return_value = None
+        mock_shutil_copy.return_value = None
+
+        def record_schedule(*args, **kwargs):
+            call_order.append("schedule")
+
+        def record_hf_save(*args, **kwargs):
+            call_order.append("hf")
+
+        mock_schedule_async_save.side_effect = record_schedule
+        mock_save_hf_weights.side_effect = record_hf_save
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.wandb_logger = Mock()
+        state.cfg.checkpoint.most_recent_k = -1
+        state.cfg.checkpoint.async_save = True
+        state.cfg.checkpoint.also_save_hf_checkpoint = True
+
+        save_checkpoint(
+            state,
+            save_checkpoint_fixtures["mock_model"],
+            save_checkpoint_fixtures["mock_optimizer"],
+            save_checkpoint_fixtures["mock_scheduler"],
+            1000000,
+            checkpointing_context={},
+            non_persistent_ckpt=False,
+        )
+
+        assert call_order == ["schedule", "hf"]
+        mock_schedule_async_save.assert_called_once_with(state, async_request)
+        mock_save_hf_weights.assert_called_once_with(
+            state, save_checkpoint_fixtures["mock_model"], "/checkpoints/iter_0001000/hf"
+        )
+
+    @patch("megatron.bridge.training.checkpointing._resolve_hf_source")
+    @patch("megatron.bridge.training.checkpointing._build_auto_bridge_for_save")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.is_available")
+    def test_save_hf_adapter_weights_uses_synchronous_bridge_save(
+        self,
+        mock_dist_available,
+        mock_dist_init,
+        mock_build_bridge,
+        mock_resolve_source,
+        save_checkpoint_fixtures,
+    ):
+        """PEFT HF adapter export should not create a separate HF async save path."""
+        mock_dist_available.return_value = False
+        mock_dist_init.return_value = False
+        mock_resolve_source.return_value = "/hf/base"
+
+        bridge = Mock()
+        mock_build_bridge.return_value = bridge
+
+        state = save_checkpoint_fixtures["mock_state"]
+        state.cfg.peft = Mock()
+
+        _save_hf_adapter_weights(state, save_checkpoint_fixtures["mock_model"], "/checkpoints/iter_0001000/hf")
+
+        bridge.save_hf_adapter.assert_called_once_with(
+            save_checkpoint_fixtures["mock_model"],
+            "/checkpoints/iter_0001000/hf",
+            peft_config=state.cfg.peft,
+            base_model_name_or_path="/hf/base",
+            show_progress=False,
+        )
+
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    def test_save_checkpoint_invalid_non_persistent_type(self, mock_print_rank_0, save_checkpoint_fixtures):
+        """Test error handling for invalid non_persistent_ckpt_type."""
+        save_checkpoint_fixtures["mock_cfg"].checkpoint.non_persistent_ckpt_type = "invalid"
+
+        with pytest.raises(ValueError) as exc_info:
+            save_checkpoint(
+                save_checkpoint_fixtures["mock_state"],
+                save_checkpoint_fixtures["mock_model"],
+                save_checkpoint_fixtures["mock_optimizer"],
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context={},
+                non_persistent_ckpt=True,
+            )
+
+        assert "Invalid non_persistent_ckpt_type" in str(exc_info.value)
+        assert "Must be 'local' or 'global'" in str(exc_info.value)
+
+
+@pytest.fixture
+def load_checkpoint_fixtures():
+    """Fixture for load checkpoint tests."""
+    mock_state = Mock(spec=GlobalState)
+    mock_state.train_state = Mock(spec=TrainState)
+    mock_state.train_state.consumed_train_samples = 0
+    mock_state.train_state.skipped_train_samples = 0
+    mock_state.train_state.consumed_valid_samples = 0
+
+    mock_cfg = Mock(spec=ConfigContainer)
+    mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+    mock_cfg.scheduler = SchedulerConfig()
+    mock_cfg.ddp = DistributedDataParallelConfig()
+    mock_cfg.checkpoint.load = "/checkpoints"
+    mock_cfg.checkpoint.pretrained_checkpoint = None
+    mock_cfg.checkpoint.finetune = False
+    mock_cfg.checkpoint.load_optim = True
+    mock_cfg.checkpoint.load_rng = True
+    mock_cfg.checkpoint.save_rng_state_per_dp_rank = False
+
+    # Create nested mock attributes that might be accessed during loading
+    mock_cfg.model = Mock()
+    mock_cfg.model.fp16 = False
+    mock_cfg.model.bf16 = False
+    mock_cfg.model.tensor_model_parallel_size = 1
+    mock_cfg.model.pipeline_model_parallel_size = 1
+    mock_cfg.rng = Mock()
+    mock_cfg.rng.data_parallel_random_init = False
+    mock_cfg.optimizer = Mock()
+    mock_cfg.optimizer.use_distributed_optimizer = False
+    mock_cfg.checkpoint.ckpt_format = "torch_dist"
+    mock_cfg.checkpoint.non_persistent_save_interval = None
+    mock_cfg.dist = Mock()
+    mock_cfg.dist.use_decentralized_pg = False
+    mock_cfg.ddp = Mock()
+    mock_cfg.ddp.use_megatron_fsdp = False
+
+    mock_state.cfg = mock_cfg
+
+    mock_model = [Mock()]
+    # The native GTP load context iterates over module parameters.
+    mock_model[0].parameters.return_value = []
+    mock_optimizer = Mock()
+    mock_scheduler = Mock()
+
+    return {
+        "mock_state": mock_state,
+        "mock_cfg": mock_cfg,
+        "mock_model": mock_model,
+        "mock_optimizer": mock_optimizer,
+        "mock_scheduler": mock_scheduler,
+    }
+
+
+class TestLoadCheckpoint:
+    """Test checkpoint loading functionality."""
+
+    @pytest.mark.parametrize("finetune", [False, True])
+    @pytest.mark.parametrize("saved_shards,requested_shards", [(2, 1), (1, 2)])
+    def test_torch_dist_rejects_changed_gtp_before_loading_weights(
+        self, load_checkpoint_fixtures, finetune, saved_shards, requested_shards
+    ):
+        cfg = load_checkpoint_fixtures["mock_cfg"]
+        cfg.checkpoint.finetune = finetune
+        cfg.checkpoint.load_optim = False
+        cfg.checkpoint.load_rng = False
+        cfg.model = SimpleNamespace(
+            tensor_model_parallel_size=1,
+            pipeline_model_parallel_size=1,
+            expert_tensor_parallel_size=1,
+            tensor_parallel_num_weight_shards=requested_shards,
+        )
+        run_config = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+                "expert_tensor_parallel_size": 1,
+                "tensor_parallel_num_weight_shards": saved_shards,
+            },
+        }
+        with (
+            patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False),
+            patch("megatron.bridge.training.checkpointing.unwrap_model", side_effect=lambda model: model),
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=True),
+            patch("megatron.bridge.training.checkpointing.read_run_config", return_value=run_config),
+            patch("megatron.bridge.training.checkpointing.generate_state_dict") as generate,
+            patch(
+                "megatron.bridge.training.checkpointing._load_base_checkpoint",
+                return_value=({}, "/checkpoints/iter_0000003", False, CheckpointType.GLOBAL),
+            ) as load_base,
+        ):
+            with pytest.raises(ValueError, match="Resharding a GTP checkpoint"):
+                _load_checkpoint_from_path(
+                    "/checkpoints/iter_0000003",
+                    load_checkpoint_fixtures["mock_state"],
+                    load_checkpoint_fixtures["mock_model"],
+                    None,
+                    None,
+                    pg_collection=Mock(),
+                )
+        load_base.assert_called_once()
+        generate.assert_not_called()
+        load_checkpoint_fixtures["mock_model"][0].load_state_dict.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing._load_hf_pretrained_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing.check_is_distributed_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    def test_load_checkpoint_from_parent_save_dir_ignores_iter_hf_export(
+        self,
+        mock_unwrap,
+        mock_get_pg_collection,
+        mock_check_dist_ckpt,
+        mock_is_hf_checkpoint_dir,
+        mock_file_exists,
+        mock_read_train_state,
+        mock_load_base,
+        mock_load_hf,
+        load_checkpoint_fixtures,
+    ):
+        """Resume from a parent save dir should use Megatron state, not the extra iter_*/hf export."""
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+        mock_get_pg_collection.return_value = Mock()
+        mock_check_dist_ckpt.return_value = False
+        mock_file_exists.return_value = True
+        mock_read_train_state.return_value = Mock(step=1000)
+        mock_is_hf_checkpoint_dir.side_effect = lambda path: str(path).endswith("/hf")
+        mock_load_base.return_value = (None, "", False, None)
+
+        result = _load_checkpoint_from_path(
+            "/checkpoints",
+            load_checkpoint_fixtures["mock_state"],
+            load_checkpoint_fixtures["mock_model"],
+            load_checkpoint_fixtures["mock_optimizer"],
+            load_checkpoint_fixtures["mock_scheduler"],
+        )
+
+        assert result == (0, 0)
+        mock_load_hf.assert_not_called()
+        mock_load_base.assert_called_once()
+
+    @patch("megatron.bridge.training.checkpointing._load_hf_pretrained_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    def test_load_checkpoint_rejects_hf_directory_for_resume_load(
+        self,
+        mock_unwrap,
+        mock_get_pg_collection,
+        mock_is_hf_checkpoint_dir,
+        mock_load_hf,
+        load_checkpoint_fixtures,
+    ):
+        """checkpoint.load should resume from native Megatron checkpoints, not HF directories."""
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+        mock_get_pg_collection.return_value = Mock()
+        mock_is_hf_checkpoint_dir.return_value = True
+        load_checkpoint_fixtures["mock_cfg"].checkpoint.load = "/hf/full-model"
+        load_checkpoint_fixtures["mock_cfg"].checkpoint.pretrained_checkpoint = None
+
+        with pytest.raises(ValueError, match="checkpoint.load does not support HuggingFace-format"):
+            _load_checkpoint_from_path(
+                "/hf/full-model",
+                load_checkpoint_fixtures["mock_state"],
+                load_checkpoint_fixtures["mock_model"],
+                load_checkpoint_fixtures["mock_optimizer"],
+                load_checkpoint_fixtures["mock_scheduler"],
+            )
+
+        mock_load_hf.assert_not_called()
+
+    def test_fsdp_layout_change_ignores_rng_state(self, load_checkpoint_fixtures):
+        """FSDP resharding must not partially restore TP/PP-keyed RNG state."""
+        cfg = load_checkpoint_fixtures["mock_cfg"]
+        cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        cfg.checkpoint.load_optim = False
+        cfg.model.tensor_model_parallel_size = 2
+        cfg.model.pipeline_model_parallel_size = 1
+        cfg.peft = None
+
+        pg_collection = Mock()
+        pg_collection.tp.size.return_value = 2
+        pg_collection.pp.size.return_value = 1
+
+        reader = Mock()
+        reader.read_metadata.return_value.state_dict_metadata = {}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False),
+            patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory", return_value=True),
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=True),
+            patch("megatron.bridge.training.checkpointing.read_run_config") as mock_read_run_config,
+            patch("megatron.bridge.training.checkpointing._get_filesystem_reader", return_value=reader),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value="fresh") as mock_get_rng_state,
+            patch(
+                "megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}
+            ) as mock_generate,
+            patch(
+                "megatron.bridge.training.checkpointing._load_base_checkpoint",
+                side_effect=[
+                    ({}, "/checkpoints/iter_0000003", False, CheckpointType.FSDP_DTENSOR),
+                    (None, "", False, None),
+                ],
+            ),
+        ):
+            mock_read_run_config.return_value = {
+                "model": {
+                    "tensor_model_parallel_size": 1,
+                    "pipeline_model_parallel_size": 1,
+                }
+            }
+
+            result = _load_checkpoint_from_path(
+                "/checkpoints/iter_0000003",
+                load_checkpoint_fixtures["mock_state"],
+                load_checkpoint_fixtures["mock_model"],
+                load_checkpoint_fixtures["mock_optimizer"],
+                load_checkpoint_fixtures["mock_scheduler"],
+                pg_collection=pg_collection,
+            )
+
+        assert result == (0, 0)
+        mock_read_run_config.assert_called_once_with("/checkpoints/iter_0000003/run_config.yaml")
+        mock_get_rng_state.assert_not_called()
+        assert mock_generate.call_args.kwargs["rng_state"] is None
+
+    def test_fsdp_without_run_config_uses_active_rng_layout(self, load_checkpoint_fixtures):
+        """Legacy FSDP checkpoints retain the active run's per-rank RNG restore behavior."""
+        cfg = load_checkpoint_fixtures["mock_cfg"]
+        cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        cfg.checkpoint.load_optim = False
+        cfg.checkpoint.save_rng_state_per_dp_rank = True
+        cfg.peft = None
+
+        pg_collection = Mock()
+        reader = Mock()
+        reader.read_metadata.return_value.state_dict_metadata = {}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False),
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=False),
+            patch("megatron.bridge.training.checkpointing._get_filesystem_reader", return_value=reader),
+            patch("megatron.bridge.training.checkpointing.get_rng_state", return_value="fresh") as mock_get_rng_state,
+            patch("megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}),
+            patch(
+                "megatron.bridge.training.checkpointing._load_base_checkpoint",
+                side_effect=[
+                    ({}, "/checkpoints/iter_0000003", False, CheckpointType.FSDP_DTENSOR),
+                    (None, "", False, None),
+                ],
+            ),
+        ):
+            result = _load_checkpoint_from_path(
+                "/checkpoints/iter_0000003",
+                load_checkpoint_fixtures["mock_state"],
+                load_checkpoint_fixtures["mock_model"],
+                load_checkpoint_fixtures["mock_optimizer"],
+                load_checkpoint_fixtures["mock_scheduler"],
+                pg_collection=pg_collection,
+            )
+
+        assert result == (0, 0)
+        mock_get_rng_state.assert_called_once_with(True, "fsdp_dtensor", pg_collection=pg_collection)
+
+    def test_fsdp_omitted_optimizer_does_not_materialize_load_state(self, load_checkpoint_fixtures):
+        """An FSDP checkpoint saved without optimizer state must leave the optimizer fresh."""
+        cfg = load_checkpoint_fixtures["mock_cfg"]
+        cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        cfg.checkpoint.load_rng = False
+        cfg.peft = None
+
+        pg_collection = Mock()
+        reader = Mock()
+        reader.read_metadata.return_value.state_dict_metadata = {"model.weight": Mock()}
+
+        optimizer = load_checkpoint_fixtures["mock_optimizer"]
+        optimizer.is_stub_optimizer = False
+        optimizer.materialized_step = 0
+
+        def materialize_optimizer_state(*_args, **_kwargs):
+            optimizer.materialized_step += 1
+            return {"state": {"step": optimizer.materialized_step}}
+
+        optimizer.sharded_state_dict.side_effect = materialize_optimizer_state
+        load_checkpoint_fixtures["mock_model"][0].state_dict_for_save_checkpoint.return_value = {"weight": Mock()}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False),
+            patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory", return_value=True),
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=True),
+            patch(
+                "megatron.bridge.training.checkpointing.read_run_config",
+                return_value={
+                    "model": {
+                        "tensor_model_parallel_size": 1,
+                        "pipeline_model_parallel_size": 1,
+                    },
+                    "checkpoint": {"save_optim": False},
+                },
+            ),
+            patch("megatron.bridge.training.checkpointing._get_filesystem_reader", return_value=reader),
+            patch(
+                "megatron.bridge.training.checkpointing._load_base_checkpoint",
+                side_effect=[
+                    ({}, "/checkpoints/iter_0000003", False, CheckpointType.FSDP_DTENSOR),
+                    (None, "", False, None),
+                ],
+            ),
+        ):
+            result = _load_checkpoint_from_path(
+                "/checkpoints/iter_0000003",
+                load_checkpoint_fixtures["mock_state"],
+                load_checkpoint_fixtures["mock_model"],
+                optimizer,
+                None,
+                pg_collection=pg_collection,
+            )
+
+        assert result == (0, 0)
+        assert optimizer.materialized_step == 0
+
+    def test_torch_dist_omitted_optimizer_keeps_load_state_fresh(self, load_checkpoint_fixtures):
+        """A torch-dist checkpoint without optimizer state must leave load state fresh."""
+        cfg = load_checkpoint_fixtures["mock_cfg"]
+        cfg.checkpoint.ckpt_format = "torch_dist"
+        cfg.checkpoint.load_rng = False
+        cfg.peft = None
+
+        state = load_checkpoint_fixtures["mock_state"]
+        state.train_state.step = 0
+        state.train_state.floating_point_operations_so_far = 0
+
+        optimizer = load_checkpoint_fixtures["mock_optimizer"]
+        optimizer.is_stub_optimizer = False
+        scheduler = load_checkpoint_fixtures["mock_scheduler"]
+        pg_collection = Mock()
+
+        checkpoint_without_optimizer = {"model": {}, "checkpoint_version": 3.0}
+        run_config = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "checkpoint": {
+                "save_optim": False,
+                "save_rng": False,
+                "fully_parallel_save": False,
+            },
+        }
+
+        with (
+            patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False),
+            patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory", return_value=True),
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=True),
+            patch("megatron.bridge.training.checkpointing.read_run_config", return_value=run_config),
+            patch("megatron.bridge.training.checkpointing.read_train_state", return_value=state.train_state),
+            patch("megatron.bridge.training.checkpointing.update_num_microbatches"),
+            patch("megatron.bridge.training.checkpointing._get_model_glu_interleave_sizes", return_value=(None, None)),
+            patch("megatron.bridge.training.checkpointing._load_model_state_dict"),
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing.load_content_metadata", return_value={}),
+            patch("megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}),
+            patch("megatron.bridge.training.checkpointing.torch.distributed.is_initialized", return_value=False),
+            patch("megatron.bridge.training.checkpointing.torch.cuda.empty_cache"),
+            patch("megatron.bridge.training.checkpointing.wandb_utils.on_load_checkpoint_success"),
+            patch("megatron.bridge.training.checkpointing.mlflow_utils.on_load_checkpoint_success"),
+            patch("megatron.bridge.training.checkpointing.comet_utils.on_load_checkpoint_success"),
+            patch(
+                "megatron.bridge.training.checkpointing._load_base_checkpoint",
+                side_effect=[
+                    ({}, "/checkpoints/iter_0000003", False, CheckpointType.GLOBAL),
+                    (
+                        checkpoint_without_optimizer,
+                        "/checkpoints/iter_0000003",
+                        False,
+                        CheckpointType.GLOBAL,
+                    ),
+                ],
+            ),
+        ):
+            result = _load_checkpoint_from_path(
+                "/checkpoints/iter_0000003",
+                state,
+                load_checkpoint_fixtures["mock_model"],
+                optimizer,
+                scheduler,
+                pg_collection=pg_collection,
+            )
+
+        assert result == (0, 0)
+        optimizer.load_state_dict.assert_not_called()
+        scheduler.load_state_dict.assert_not_called()
+
+    @patch("torch.distributed.is_initialized")
+    @patch("megatron.bridge.training.checkpointing._build_auto_bridge_for_save")
+    def test_load_hf_pretrained_checkpoint_initializes_from_hf_source(
+        self,
+        mock_build_bridge,
+        mock_dist_init,
+        load_checkpoint_fixtures,
+    ):
+        """HF pretrained initialization should not require a separate hf_source_path."""
+        mock_dist_init.return_value = False
+        bridge = Mock()
+        mock_build_bridge.return_value = bridge
+
+        _load_hf_pretrained_checkpoint(
+            "/hf/full-model",
+            load_checkpoint_fixtures["mock_state"],
+            load_checkpoint_fixtures["mock_model"],
+            load_checkpoint_fixtures["mock_optimizer"],
+            skip_load_to_model_and_opt=False,
+        )
+
+        mock_build_bridge.assert_called_once_with(load_checkpoint_fixtures["mock_cfg"], hf_source="/hf/full-model")
+        bridge.load_hf_weights.assert_called_once_with(
+            load_checkpoint_fixtures["mock_model"], hf_path="/hf/full-model"
+        )
+
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.read_run_config")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.checkpoint_exists")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.barrier")
+    def test_load_checkpoint_not_found(
+        self,
+        mock_barrier,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_exists,
+        mock_unwrap,
+        mock_read_config,
+        mock_read_state,
+        mock_load_base,
+        load_checkpoint_fixtures,
+    ):
+        """Test loading when no checkpoint is found."""
+        # Setup mocks
+        mock_dist_init.return_value = False  # Disable distributed for simpler testing
+        mock_exists.return_value = False
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+        mock_load_base.return_value = (None, "", False, None)
+        mock_read_config.return_value = {}
+
+        result = load_checkpoint(
+            load_checkpoint_fixtures["mock_state"],
+            load_checkpoint_fixtures["mock_model"],
+            load_checkpoint_fixtures["mock_optimizer"],
+            load_checkpoint_fixtures["mock_scheduler"],
+        )
+
+        # Should return default values when no checkpoint found
+        assert result == (0, 0)
+
+    @pytest.mark.parametrize("optimizer_load_error", [False, True])
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False)
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.read_run_config")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.checkpoint_exists")
+    @patch("megatron.bridge.training.checkpointing.set_checkpoint_version")
+    @patch("megatron.bridge.training.checkpointing.update_num_microbatches")
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("random.setstate")
+    @patch("numpy.random.set_state")
+    @patch("torch.set_rng_state")
+    @patch("torch.cuda.set_rng_state")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.barrier")
+    @patch("torch.cuda.empty_cache")
+    @patch("os.path.exists")  # Add patch for train state file existence check
+    @pytest.mark.parametrize("saved_version", [3.0, 3.1])
+    def test_load_checkpoint_found(
+        self,
+        mock_exists_os,
+        mock_empty_cache,
+        mock_barrier,
+        mock_dist_init,
+        mock_torch_cuda_set_rng,
+        mock_torch_set_rng,
+        mock_np_set_state,
+        mock_random_setstate,
+        mock_dist_ckpt,
+        mock_get_rng_state,
+        mock_generate_state_dict,
+        mock_tensor_parallel,
+        mock_rerun_machine,
+        mock_get_pg_collection,
+        mock_print_rank_0,
+        mock_is_last_rank,
+        mock_wandb,
+        mock_update_microbatches,
+        mock_set_version,
+        mock_exists,
+        mock_unwrap,
+        mock_read_config,
+        mock_read_state,
+        mock_load_base,
+        mock_is_hf_checkpoint_dir,
+        load_checkpoint_fixtures,
+        optimizer_load_error,
+        saved_version,
+    ):
+        """Direct loading syncs HDO only after a successful restore and context cleanup."""
+        # Setup mocks
+        mock_dist_init.return_value = False  # Disable distributed for simpler testing
+        mock_is_last_rank.return_value = False
+        mock_exists.return_value = True
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+
+        # Mock train state file existence (for train_state.pt check)
+        mock_exists_os.return_value = True  # train_state.pt exists (normal case)
+
+        mock_train_state = Mock()
+        mock_train_state.step = 1000
+        mock_train_state.floating_point_operations_so_far = 500000
+        mock_read_state.return_value = mock_train_state
+
+        # Mock utility functions
+        mock_generate_state_dict.return_value = {"test": "state"}
+        mock_get_rng_state.return_value = Mock()
+
+        # Mock RNG functions (no-op)
+        mock_random_setstate.return_value = None
+        mock_np_set_state.return_value = None
+        mock_torch_set_rng.return_value = None
+        mock_torch_cuda_set_rng.return_value = None
+
+        # Mock tensor parallel
+        mock_rng_tracker = Mock()
+        mock_rng_tracker.set_states = Mock()
+        mock_tensor_parallel.get_cuda_rng_tracker.return_value = mock_rng_tracker
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        load_checkpoint_fixtures["mock_cfg"].optimizer.use_distributed_optimizer = True
+
+        # Mock dist_checkpointing
+        mock_dist_ckpt.load_content_metadata.return_value = {"distrib_optim_sharding_type": "dp_reshardable"}
+        legacy_key = "optimizer.distributed.dp_group_idx_0.gbuf_idx_0.dtype_(torch.bfloat16, torch.bfloat16).bucket_idx_0.exp_avg"
+        mock_dist_ckpt.load_tensors_metadata.return_value = {legacy_key: Mock()}
+        mock_dist_ckpt.load.return_value = {}
+
+        # Mock rerun state machine
+        mock_rerun_machine.return_value.load_state_dict = Mock()
+
+        # Mock run config to avoid file I/O
+        mock_run_config = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,
+            },
+            "checkpoint": {
+                "save_rng": True,
+                "save_optim": True,
+                "fully_parallel_save": False,
+            },
+        }
+        mock_read_config.return_value = mock_run_config
+
+        mock_state_dict = {
+            "checkpoint_version": saved_version,
+            "model": {"param": "value"},
+            "optimizer": {"param_groups": []},  # Mock optimizer state
+            "opt_param_scheduler": {"scheduler_state": "test"},  # Mock scheduler state
+            "rerun_state_machine": {"state": "test"},  # Mock rerun state
+            "rng_state": [
+                {
+                    "random_rng_state": ("test", [1, 2, 3]),
+                    "np_rng_state": ("MT19937", [1, 2, 3], 4, 0, 0.0),
+                    "torch_rng_state": torch.tensor([1, 2, 3]),
+                    "cuda_rng_state": torch.tensor([4, 5, 6]),
+                    "rng_tracker_states": {"test_tracker": "state"},
+                }
+            ],  # Mock RNG state
+        }
+        mock_load_base.return_value = (mock_state_dict, "/ckpt/path", False, CheckpointType.GLOBAL)
+
+        optimizer = load_checkpoint_fixtures["mock_optimizer"]
+        optimizer.is_stub_optimizer = False
+        events = []
+
+        @contextmanager
+        def load_context(name, *_args, **_kwargs):
+            events.append(f"enter {name}")
+            try:
+                yield
+            finally:
+                events.append(f"exit {name}")
+
+        def load_optimizer(loaded_state):
+            assert loaded_state is mock_state_dict["optimizer"]
+            assert not torch.is_grad_enabled()
+            events.append("load optimizer")
+            if optimizer_load_error:
+                raise RuntimeError("optimizer restore failed")
+
+        optimizer.load_state_dict.side_effect = load_optimizer
+        with (
+            patch(
+                "megatron.bridge.training.checkpointing.hybrid_optimizer_state_loading",
+                side_effect=partial(load_context, "hybrid"),
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.memory_efficient_precision_aware_optimizer_state_checkpointing",
+                side_effect=partial(load_context, "staging"),
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.sync_hybrid_device_optimizer_fp32_master_copies",
+                side_effect=lambda _optimizer: events.append("sync optimizer"),
+            ) as sync_optimizer,
+        ):
+            if optimizer_load_error:
+                with pytest.raises(RuntimeError, match="optimizer restore failed"):
+                    load_checkpoint(
+                        load_checkpoint_fixtures["mock_state"],
+                        load_checkpoint_fixtures["mock_model"],
+                        optimizer,
+                        load_checkpoint_fixtures["mock_scheduler"],
+                    )
+            else:
+                result = load_checkpoint(
+                    load_checkpoint_fixtures["mock_state"],
+                    load_checkpoint_fixtures["mock_model"],
+                    optimizer,
+                    load_checkpoint_fixtures["mock_scheduler"],
+                )
+
+        assert events[:5] == ["enter hybrid", "enter staging", "load optimizer", "exit staging", "exit hybrid"]
+        if optimizer_load_error:
+            assert len(events) == 5
+            sync_optimizer.assert_not_called()
+            return
+        assert events[5:] == ["sync optimizer"]
+        sync_optimizer.assert_called_once_with(optimizer)
+
+        # Verify results
+        assert result[0] == 1000  # iteration
+        assert result[1] == 500000  # FLOPs
+        mock_set_version.assert_called_with(saved_version)
+        metadata = mock_generate_state_dict.call_args.kwargs["optim_sd_kwargs"]["metadata"]
+        assert metadata["checkpoint_version"] == saved_version
+        if saved_version < 3.1 and hasattr(distrib_optimizer, "get_legacy_grad_dtypes"):
+            assert metadata["legacy_grad_dtypes"] == {"torch.bfloat16": "torch.bfloat16"}
+            mock_dist_ckpt.load_tensors_metadata.assert_called_once_with("/ckpt/path")
+        else:
+            assert "legacy_grad_dtypes" not in metadata
+            mock_dist_ckpt.load_tensors_metadata.assert_not_called()
+        # Verify that train_state.pt was read (not megatron-lm fallback)
+        mock_read_state.assert_called_once()
+
+
+@pytest.fixture
+def mock_config():
+    """Fixture for config-based tests."""
+    mock_cfg = Mock(spec=ConfigContainer)
+    mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+    return mock_cfg
+
+
+class TestNonPersistentCheckpoints:
+    """Test non-persistent checkpoint functionality."""
+
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("os.path.exists")
+    def test_get_non_persistent_iteration_global(self, mock_isfile, mock_read_state):
+        """Test getting iteration from global non-persistent checkpoint."""
+        non_persistent_ckpt_type = "global"
+        mock_isfile.return_value = True
+
+        mock_train_state = Mock()
+        mock_train_state.step = 1500
+        mock_read_state.return_value = mock_train_state
+
+        result = _get_non_persistent_iteration("/np_dir", non_persistent_ckpt_type)
+
+        assert result == 1500
+        mock_read_state.assert_called_once()
+
+    def test_get_non_persistent_iteration_none(self):
+        """Test when non_persistent_ckpt_type is None."""
+        non_persistent_ckpt_type = None
+
+        result = _get_non_persistent_iteration("/np_dir", non_persistent_ckpt_type)
+
+        assert result == -1
+
+    def test_get_non_persistent_iteration_local(self):
+        """Test getting iteration from local non-persistent checkpoint."""
+        non_persistent_ckpt_type = "local"
+        mock_context = {"local_checkpoint_manager": Mock()}
+        mock_context["local_checkpoint_manager"].find_latest.return_value = 2000
+
+        result = _get_non_persistent_iteration("/np_dir", non_persistent_ckpt_type, mock_context)
+
+        assert result == 2000
+
+    def test_get_non_persistent_iteration_invalid_type(self):
+        """Test error for invalid non_persistent_ckpt_type."""
+        non_persistent_ckpt_type = "invalid"
+
+        with pytest.raises(ValueError):
+            _get_non_persistent_iteration("/np_dir", non_persistent_ckpt_type)
+
+
+class TestCheckpointingContext:
+    """Test checkpointing context initialization."""
+
+    def test_init_checkpointing_context_non_local(self):
+        """Test context initialization for non-local checkpointing."""
+        mock_config = Mock(spec=CheckpointConfig)
+        mock_config.non_persistent_ckpt_type = "global"
+
+        result = init_checkpointing_context(mock_config)
+
+        assert result == {}
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_RESIL", True)
+    @patch("nvidia_resiliency_ext.checkpointing.local.ckpt_managers.local_manager.LocalCheckpointManager")
+    @patch("nvidia_resiliency_ext.checkpointing.local.replication.strategies.CliqueReplicationStrategy")
+    def test_init_checkpointing_context_local(self, mock_strategy, mock_manager):
+        """Test context initialization for local checkpointing."""
+        mock_config = Mock(spec=CheckpointConfig)
+        mock_config.non_persistent_ckpt_type = "local"
+        mock_config.replication = True
+        mock_config.replication_jump = 2
+        mock_config.replication_factor = 3
+        mock_config.non_persistent_local_ckpt_dir = "/local/ckpt"
+
+        mock_strategy.from_replication_params.return_value = "mock_strategy"
+        mock_manager.return_value = "mock_manager"
+
+        result = init_checkpointing_context(mock_config)
+
+        assert "local_checkpoint_manager" in result
+        assert result["local_checkpoint_manager"] == "mock_manager"
+        mock_strategy.from_replication_params.assert_called_with(2, 3)
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_RESIL", False)
+    def test_init_checkpointing_context_local_no_resil(self):
+        """Test error when nvidia_resiliency_ext is not available."""
+        mock_config = Mock(spec=CheckpointConfig)
+        mock_config.non_persistent_ckpt_type = "local"
+
+        with pytest.raises(RuntimeError) as exc_info:
+            init_checkpointing_context(mock_config)
+
+        assert "nvidia_resiliency_ext" in str(exc_info.value)
+
+
+class TestCleanupNonPersistentCheckpoints:
+    """Test cleanup of old non-persistent checkpoints."""
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("shutil.rmtree")
+    def test_cleanup_old_non_persistent_checkpoint(self, mock_rmtree, mock_get_rank, mock_dist_init):
+        """Test cleanup of old checkpoints."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create mock checkpoint directories
+            save_dir = Path(temp_dir)
+            old_ckpt1 = save_dir / "iter_0001000"
+            old_ckpt2 = save_dir / "iter_0002000"
+            new_ckpt = save_dir / "iter_0003000"
+
+            old_ckpt1.mkdir()
+            old_ckpt2.mkdir()
+            new_ckpt.mkdir()
+
+            cleanup_old_non_persistent_checkpoint(str(save_dir), leave_ckpt_num=1, do_async=False)
+
+            # Should remove the two older checkpoints
+            assert mock_rmtree.call_count == 2
+
+    @patch("torch.distributed.is_initialized", return_value=False)
+    def test_cleanup_old_non_persistent_checkpoint_with_msc_url(self, mock_dist_init, tmp_path):
+        """Retention removes old checkpoints from an MSC-backed root."""
+        MultiStorageClientFeature.enable()
+        msc = MultiStorageClientFeature.import_package()
+        save_dir = f"msc://default{tmp_path}/checkpoints"
+        for name in ("iter_0001000", "iter_0002000", "iter_0003000"):
+            msc.os.makedirs(os.path.join(save_dir, name), exist_ok=True)
+
+        cleanup_old_non_persistent_checkpoint(save_dir, leave_ckpt_num=1, do_async=False)
+
+        retained_checkpoints = sorted(checkpoint.name for checkpoint in msc.Path(save_dir).glob("iter_*"))
+        assert retained_checkpoints == ["iter_0003000"]
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    def test_cleanup_old_non_persistent_checkpoint_non_rank0(self, mock_get_rank, mock_dist_init):
+        """Test that non-rank0 processes don't perform cleanup."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 1
+
+        with patch("shutil.rmtree") as mock_rmtree:
+            cleanup_old_non_persistent_checkpoint("/fake/dir", leave_ckpt_num=1)
+            mock_rmtree.assert_not_called()
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("shutil.rmtree")
+    def test_cleanup_old_non_persistent_checkpoint_leave_zero(self, mock_rmtree, mock_get_rank, mock_dist_init):
+        """leave_ckpt_num=0 should remove all checkpoints, not keep them (guards the [:-0] pitfall)."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 0
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            save_dir = Path(temp_dir)
+            for name in ("iter_0001000", "iter_0002000", "iter_0003000"):
+                (save_dir / name).mkdir()
+
+            cleanup_old_non_persistent_checkpoint(str(save_dir), leave_ckpt_num=0, do_async=False)
+
+            # All three checkpoints must be scheduled for removal.
+            assert mock_rmtree.call_count == 3
+
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.distributed.get_rank", return_value=0)
+    def test_cleanup_old_non_persistent_checkpoint_max_iteration(self, mock_get_rank, mock_dist_init, tmp_path):
+        """Checkpoints newer than max_iteration must not participate in retention cleanup."""
+        old_checkpoint = tmp_path / "iter_0000010"
+        retained_checkpoint = tmp_path / "iter_0000020"
+        future_incomplete_checkpoint = tmp_path / "iter_0000030"
+        for checkpoint in (old_checkpoint, retained_checkpoint, future_incomplete_checkpoint):
+            checkpoint.mkdir()
+
+        cleanup_old_non_persistent_checkpoint(
+            str(tmp_path),
+            leave_ckpt_num=1,
+            do_async=False,
+            max_iteration=20,
+        )
+
+        assert not old_checkpoint.exists()
+        assert retained_checkpoint.is_dir()
+        assert future_incomplete_checkpoint.is_dir()
+
+    @patch("torch.distributed.is_initialized", return_value=True)
+    @patch("torch.distributed.get_rank", return_value=0)
+    def test_cleanup_keeps_complete_checkpoint_generation_with_energon_state(
+        self, mock_get_rank, mock_dist_init, tmp_path
+    ):
+        """Retention counts a model checkpoint and its Energon state as one generation."""
+        dataloader_checkpoint = tmp_path / "energon" / "iter_0000010"
+        dataloader_checkpoint.mkdir(parents=True)
+        (dataloader_checkpoint / "train_dataloader_dprank000.pt").touch()
+        model_checkpoint = tmp_path / "iter_0000010"
+        model_checkpoint.mkdir()
+
+        cleanup_old_non_persistent_checkpoint(
+            str(tmp_path),
+            leave_ckpt_num=1,
+            do_async=False,
+            max_iteration=10,
+        )
+
+        assert model_checkpoint.is_dir()
+        assert dataloader_checkpoint.is_dir()
+
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    def test_cleanup_old_non_persistent_checkpoint_retain_interval(self, mock_get_rank, mock_dist_init):
+        """Test cleanup of old checkpoints."""
+        mock_dist_init.return_value = True
+        mock_get_rank.return_value = 0
+
+        def get_ckpt_nums(path, return_ckpts=False):
+            count = 0
+            ckpts = []
+            for root, dirs, files in os.walk(path):
+                count += len(dirs)
+                ckpts.append(dirs)
+
+            if return_ckpts:
+                return count, sorted(ckpts[0])
+            else:
+                return count
+
+        # save ckpt every 10 steps with max_steps=200
+        save_interval = 10
+        max_steps = 200
+        with tempfile.TemporaryDirectory() as temp_dir:
+            # Create mock checkpoint directories
+            save_dir = Path(temp_dir)
+            for i in range(10, (max_steps + 10), save_interval):
+                old_ckpt = save_dir / "iter_{:07d}".format(i)
+                old_ckpt.mkdir()
+
+            # save last top 5 ckpts
+            cleanup_old_non_persistent_checkpoint(str(save_dir), leave_ckpt_num=5, do_async=False)
+            assert get_ckpt_nums(str(save_dir), return_ckpts=True) == (
+                5,
+                ["iter_0000160", "iter_0000170", "iter_0000180", "iter_0000190", "iter_0000200"],
+            )
+
+
+class TestLoadBaseCheckpoint:
+    """Test base checkpoint loading logic."""
+
+    @pytest.fixture
+    def base_config(self):
+        """Fixture for base checkpoint tests."""
+        mock_cfg = Mock(spec=CheckpointConfig)
+        mock_cfg.exit_on_missing_checkpoint = False
+        mock_cfg.ckpt_step = None
+        mock_cfg.non_persistent_ckpt_type = None
+        return mock_cfg
+
+    @pytest.fixture
+    def mock_pg_collection(self):
+        """Fixture for mock pg_collection."""
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+        mock_pg.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg.dp_cp_gtp_remat.size.return_value = 1
+        mock_pg.pp.rank.return_value = 0
+        mock_pg.pp.size.return_value = 1
+        mock_pg.tp.rank.return_value = 0
+        mock_pg.tp.size.return_value = 1
+        return mock_pg
+
+    @patch("megatron.bridge.training.checkpointing.load_fsdp_dtensor_checkpoint")
+    def test_global_non_persistent_fsdp_uses_fsdp_loader(
+        self,
+        mock_load_fsdp,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Global non-persistent FSDP checkpoints must use the DTensor loader."""
+        base_config.ckpt_format = "fsdp_dtensor"
+        base_config.non_persistent_ckpt_type = "global"
+        full_config = Mock(spec=ConfigContainer)
+        expected = ({}, "/ckpt/iter_0000100", False, CheckpointType.FSDP_DTENSOR)
+        mock_load_fsdp.return_value = expected
+
+        result = _load_non_persistent_base_checkpoint(
+            "/ckpt",
+            base_config,
+            True,
+            None,
+            100,
+            checkpointing_context={},
+            cfg=full_config,
+            pg_collection=mock_pg_collection,
+        )
+
+        assert result == expected
+        mock_load_fsdp.assert_called_once_with(
+            "/ckpt",
+            base_config,
+            True,
+            None,
+            100,
+            checkpointing_context={},
+            cfg=full_config,
+        )
+
+    def test_global_non_persistent_checkpoint_is_found_under_distinct_save_dir(self, tmp_path):
+        """An unchanged restart discovers the non-persistent checkpoint written under save."""
+        load_dir = tmp_path / "input"
+        save_dir = tmp_path / "output"
+        non_persistent_dir = save_dir / "non_persistent"
+        non_persistent_dir.mkdir(parents=True)
+        (non_persistent_dir / "latest_train_state.pt").touch()
+
+        ckpt_cfg = Mock(spec=CheckpointConfig)
+        ckpt_cfg.save = str(save_dir)
+        ckpt_cfg.non_persistent_ckpt_type = "global"
+        ckpt_cfg.non_persistent_global_ckpt_dir = None
+
+        assert _has_global_non_persistent_checkpoint(str(load_dir), ckpt_cfg)
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format", return_value="torch_dist")
+    @patch("megatron.bridge.training.checkpointing._load_non_persistent_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration", return_value=(100, False))
+    def test_newer_global_non_persistent_checkpoint_is_loaded_from_distinct_save_dir(
+        self,
+        _mock_resolve,
+        mock_load_non_persistent,
+        _mock_get_format,
+        mock_load_persistent,
+        tmp_path,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A restart prefers the newer recovery point written under checkpoint.save."""
+        load_dir = tmp_path / "input"
+        save_dir = tmp_path / "output"
+        non_persistent_dir = save_dir / "non_persistent"
+        non_persistent_dir.mkdir(parents=True)
+        torch.save(
+            TrainState(step=200).state_dict(),
+            get_checkpoint_train_state_filename(str(non_persistent_dir), prefix="latest"),
+        )
+
+        base_config.save = str(save_dir)
+        base_config.ckpt_format = "torch_dist"
+        base_config.non_persistent_ckpt_type = "global"
+        base_config.non_persistent_global_ckpt_dir = None
+        expected = ({"model": "newer"}, str(non_persistent_dir / "iter_0000200"), False, CheckpointType.GLOBAL)
+        mock_load_non_persistent.return_value = expected
+
+        checkpointing_context = {}
+        result = _load_base_checkpoint(
+            str(load_dir),
+            base_config,
+            checkpointing_context=checkpointing_context,
+            pg_collection=mock_pg_collection,
+        )
+
+        assert result == expected
+        assert mock_load_non_persistent.call_args.args[0] == str(non_persistent_dir)
+        assert mock_load_non_persistent.call_args.args[4] == 200
+        assert checkpointing_context["dataloader_state_dir"] == str(save_dir / DATALOADER_STATE_SUBDIR)
+        mock_load_persistent.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format", return_value="torch_dist")
+    @patch("megatron.bridge.training.checkpointing._load_non_persistent_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration", return_value=(100, False))
+    def test_ckpt_step_overrides_newer_non_persistent_checkpoint(
+        self,
+        mock_resolve,
+        mock_load_non_persistent,
+        _mock_get_format,
+        mock_load_persistent,
+        tmp_path,
+        base_config,
+        mock_pg_collection,
+    ):
+        """An explicit checkpoint step selects that persistent iteration exactly."""
+        load_dir = tmp_path / "input"
+        non_persistent_dir = tmp_path / "recovery"
+        non_persistent_dir.mkdir(parents=True)
+        torch.save(
+            TrainState(step=200).state_dict(),
+            get_checkpoint_train_state_filename(str(non_persistent_dir), prefix="latest"),
+        )
+
+        base_config.ckpt_step = 100
+        base_config.save = str(tmp_path / "output")
+        base_config.ckpt_format = "torch_dist"
+        base_config.non_persistent_ckpt_type = "global"
+        base_config.non_persistent_global_ckpt_dir = str(non_persistent_dir)
+        mock_load_non_persistent.return_value = (
+            {"model": "recovery"},
+            str(non_persistent_dir / "iter_0000200"),
+            False,
+            CheckpointType.GLOBAL,
+        )
+        expected = ({"model": "requested"}, str(load_dir / "iter_0000100"), False, CheckpointType.GLOBAL)
+        mock_load_persistent.return_value = expected
+
+        checkpointing_context = {}
+        result = _load_base_checkpoint(
+            str(load_dir),
+            base_config,
+            checkpointing_context=checkpointing_context,
+            pg_collection=mock_pg_collection,
+        )
+
+        assert result == expected
+        mock_resolve.assert_called_once_with(load_dir=str(load_dir), ckpt_step_override=100)
+        mock_load_non_persistent.assert_not_called()
+        assert checkpointing_context["dataloader_state_dir"] == str(load_dir / DATALOADER_STATE_SUBDIR)
+
+    @patch("megatron.bridge.training.checkpointing._load_non_persistent_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration", return_value=(50, False))
+    def test_newer_global_non_persistent_checkpoint_under_load_remains_available(
+        self,
+        _mock_resolve,
+        mock_load_non_persistent,
+        tmp_path,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A distinct empty save root does not hide a newer recovery point under load."""
+        load_dir = tmp_path / "input"
+        save_dir = tmp_path / "output"
+        load_non_persistent_dir = load_dir / "non_persistent"
+        save_non_persistent_dir = save_dir / "non_persistent"
+        load_non_persistent_dir.mkdir(parents=True)
+        save_non_persistent_dir.mkdir(parents=True)
+        torch.save(
+            TrainState(step=200).state_dict(),
+            get_checkpoint_train_state_filename(str(load_non_persistent_dir), prefix="latest"),
+        )
+        torch.save(
+            TrainState(step=100).state_dict(),
+            get_checkpoint_train_state_filename(str(save_non_persistent_dir), prefix="latest"),
+        )
+
+        base_config.save = str(save_dir)
+        base_config.non_persistent_ckpt_type = "global"
+        base_config.non_persistent_global_ckpt_dir = None
+        expected = (
+            {"model": "newer"},
+            str(load_non_persistent_dir / "iter_0000200"),
+            False,
+            CheckpointType.GLOBAL,
+        )
+        mock_load_non_persistent.return_value = expected
+
+        checkpointing_context = {}
+        result = _load_base_checkpoint(
+            str(load_dir),
+            base_config,
+            checkpointing_context=checkpointing_context,
+            pg_collection=mock_pg_collection,
+        )
+
+        assert result == expected
+        assert mock_load_non_persistent.call_args.args[0] == str(load_non_persistent_dir)
+        assert mock_load_non_persistent.call_args.args[4] == 200
+        assert checkpointing_context["dataloader_state_dir"] == str(load_dir / DATALOADER_STATE_SUBDIR)
+
+    @patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    def test_load_base_checkpoint_no_checkpoint(
+        self, mock_file_exists, mock_get_np_iter, base_config, mock_pg_collection
+    ):
+        """Test when no checkpoint is found."""
+        mock_get_np_iter.return_value = -1
+        mock_file_exists.return_value = False
+
+        result = _load_base_checkpoint("/fake/dir", base_config, pg_collection=mock_pg_collection)
+
+        assert result == (None, "", False, None)
+
+    @patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("os.path.exists")
+    def test_load_base_checkpoint_non_distributed_error(
+        self,
+        mock_os_exists,
+        mock_file_exists,
+        mock_dist_ckpt,
+        mock_read_state,
+        mock_get_np_iter,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Test error when trying to load non-distributed checkpoint."""
+        mock_get_np_iter.return_value = -1
+        mock_file_exists.return_value = True  # train_state file exists
+
+        mock_train_state = Mock()
+        mock_train_state.step = 1000
+        mock_read_state.return_value = mock_train_state
+
+        mock_dist_ckpt.check_is_distributed_checkpoint.return_value = False
+        # Mock that .metadata file does NOT exist (so it's not fsdp_dtensor)
+        mock_os_exists.return_value = False
+
+        with pytest.raises(NotImplementedError) as exc_info:
+            _load_base_checkpoint("/fake/dir", base_config, pg_collection=mock_pg_collection)
+
+        assert "Unknown checkpoint format" in str(exc_info.value)
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_load_base_checkpoint_direct_iteration_dir_torch_dist(
+        self,
+        mock_resolve,
+        mock_get_format,
+        mock_load_global,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Direct iteration directory with torch_dist format delegates to _load_global_dist_base_checkpoint."""
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "torch_dist"
+        mock_load_global.return_value = ({"model": "data"}, "/ckpt/iter_0001000", False, CheckpointType.GLOBAL)
+
+        result = _load_base_checkpoint("/ckpt/iter_0001000", base_config, rank0=True, pg_collection=mock_pg_collection)
+
+        state_dict, _, _, ckpt_type = result
+        assert state_dict == {"model": "data"}
+        assert ckpt_type == CheckpointType.GLOBAL
+
+        mock_load_global.assert_called_once()
+        call_kwargs = mock_load_global.call_args
+        assert (
+            call_kwargs[1].get("checkpoint_path_override") == "/ckpt/iter_0001000"
+            or call_kwargs[0][6] == "/ckpt/iter_0001000"
+        )
+
+    @patch("megatron.bridge.training.checkpointing.load_fsdp_dtensor_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_load_base_checkpoint_direct_iteration_dir_fsdp_dtensor(
+        self,
+        mock_resolve,
+        mock_get_format,
+        mock_load_fsdp,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Direct iteration directory with fsdp_dtensor format delegates to load_fsdp_dtensor_checkpoint."""
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "fsdp_dtensor"
+        mock_load_fsdp.return_value = ({}, "/ckpt/iter_0001000", False, CheckpointType.FSDP_DTENSOR)
+
+        result = _load_base_checkpoint("/ckpt/iter_0001000", base_config, rank0=True, pg_collection=mock_pg_collection)
+
+        _, _, _, ckpt_type = result
+        assert ckpt_type == CheckpointType.FSDP_DTENSOR
+
+        mock_load_fsdp.assert_called_once()
+
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_load_base_checkpoint_direct_iteration_dir_unsupported_format(
+        self,
+        mock_resolve,
+        mock_get_format,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Direct iteration directory with unsupported format raises NotImplementedError."""
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "zarr"
+
+        with pytest.raises(NotImplementedError, match="not supported"):
+            _load_base_checkpoint("/ckpt/iter_0001000", base_config, pg_collection=mock_pg_collection)
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_load_base_checkpoint_direct_iteration_dir_skips_non_persistent(
+        self,
+        mock_resolve,
+        mock_get_format,
+        mock_load_global,
+        base_config,
+        mock_pg_collection,
+    ):
+        """Direct iteration directory path skips non-persistent checkpoint lookup entirely."""
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "torch_dist"
+        mock_load_global.return_value = ({"model": "data"}, "/ckpt/iter_0001000", False, CheckpointType.GLOBAL)
+
+        with patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration") as mock_get_np_iter:
+            _load_base_checkpoint("/ckpt/iter_0001000", base_config, pg_collection=mock_pg_collection)
+            mock_get_np_iter.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_records_dataloader_state_dir_under_load_dir_for_persistent(
+        self,
+        mock_resolve,
+        mock_get_np_iter,
+        mock_file_exists,
+        mock_get_format,
+        mock_load_global,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A persistent checkpoint records its dataloader-state dir under load_dir, for setup() to restore."""
+        mock_resolve.return_value = (100, False)
+        mock_get_np_iter.return_value = -1  # no non-persistent checkpoint
+        mock_file_exists.return_value = True
+        mock_get_format.return_value = "torch_dist"
+        base_config.ckpt_format = "torch_dist"
+        mock_load_global.return_value = ({"model": "x"}, "/ckpt/iter_0000100", False, CheckpointType.GLOBAL)
+
+        ctx = {}
+        _load_base_checkpoint("/ckpt", base_config, checkpointing_context=ctx, pg_collection=mock_pg_collection)
+
+        assert ctx["dataloader_state_dir"] == os.path.join("/ckpt", DATALOADER_STATE_SUBDIR)
+
+    @patch("megatron.bridge.training.checkpointing._load_non_persistent_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_records_dataloader_state_dir_under_save_for_non_persistent(
+        self,
+        mock_resolve,
+        mock_get_np_iter,
+        mock_file_exists,
+        mock_load_np,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A non-persistent/local checkpoint records its dataloader-state dir under checkpoint.save, not load."""
+        base_config.save = "/save_dir"
+        mock_resolve.return_value = (50, False)  # older persistent
+        mock_get_np_iter.return_value = 100  # newer non-persistent wins
+        mock_file_exists.return_value = False
+        mock_load_np.return_value = ({"model": "x"}, "np_name", False, CheckpointType.GLOBAL)
+
+        ctx = {}
+        _load_base_checkpoint("/load_dir", base_config, checkpointing_context=ctx, pg_collection=mock_pg_collection)
+
+        assert ctx["dataloader_state_dir"] == os.path.join("/save_dir", DATALOADER_STATE_SUBDIR)
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_records_dataloader_state_dir_one_level_up_for_direct_iteration(
+        self,
+        mock_resolve,
+        mock_get_format,
+        mock_load_global,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A direct iter_N directory records its dataloader-state dir one level up (the energon sibling)."""
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "torch_dist"
+        mock_load_global.return_value = ({"model": "x"}, "/ckpt/iter_0001000", False, CheckpointType.GLOBAL)
+
+        ctx = {}
+        _load_base_checkpoint(
+            "/ckpt/iter_0001000", base_config, checkpointing_context=ctx, pg_collection=mock_pg_collection
+        )
+
+        assert ctx["dataloader_state_dir"] == os.path.join("/ckpt", DATALOADER_STATE_SUBDIR)
+
+    @patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing._get_checkpoint_format")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_records_msc_dataloader_state_dir_one_level_up_for_direct_iteration(
+        self,
+        mock_resolve,
+        mock_get_format,
+        mock_load_global,
+        base_config,
+        mock_pg_collection,
+    ):
+        """A direct MSC iter_N path preserves its URI when recording the Energon sibling."""
+        MultiStorageClientFeature.enable()
+        mock_resolve.return_value = (_DIRECT_ITERATION_DIR_SENTINEL, False)
+        mock_get_format.return_value = "torch_dist"
+        mock_load_global.return_value = (
+            {"model": "x"},
+            "msc://default/ckpt/iter_0001000",
+            False,
+            CheckpointType.GLOBAL,
+        )
+
+        ctx = {}
+        _load_base_checkpoint(
+            "msc://default/ckpt/iter_0001000",
+            base_config,
+            checkpointing_context=ctx,
+            pg_collection=mock_pg_collection,
+        )
+
+        assert ctx["dataloader_state_dir"] == "msc://default/ckpt/energon"
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration")
+    @patch("megatron.bridge.training.checkpointing._resolve_checkpoint_iteration")
+    def test_records_none_when_no_checkpoint_found(
+        self,
+        mock_resolve,
+        mock_get_np_iter,
+        mock_file_exists,
+        base_config,
+        mock_pg_collection,
+    ):
+        """No checkpoint selected => dataloader_state_dir is None so resume restores nothing."""
+        mock_resolve.return_value = (-1, False)
+        mock_get_np_iter.return_value = -1
+        mock_file_exists.return_value = False
+
+        ctx = {}
+        _load_base_checkpoint("/ckpt", base_config, checkpointing_context=ctx, pg_collection=mock_pg_collection)
+
+        assert ctx["dataloader_state_dir"] is None
+
+
+class TestRecordDataloaderStateDir:
+    """Tests for _record_dataloader_state_dir, which captures where setup() restores dataloader state."""
+
+    def test_joins_energon_subdir(self):
+        ctx = {}
+        _record_dataloader_state_dir(ctx, "/ckpt")
+        assert ctx["dataloader_state_dir"] == os.path.join("/ckpt", DATALOADER_STATE_SUBDIR)
+
+    def test_none_base_records_none(self):
+        ctx = {}
+        _record_dataloader_state_dir(ctx, None)
+        assert ctx["dataloader_state_dir"] is None
+
+    def test_none_context_is_noop(self):
+        """Must not raise when there is no context to record into."""
+        _record_dataloader_state_dir(None, "/ckpt")
+
+
+class TestLoadModelWeightsFromCheckpoint:
+    """Test the _load_model_weights_from_checkpoint function."""
+
+    @pytest.mark.parametrize("saved_shards,requested_shards", [(2, 1), (1, 2)])
+    @pytest.mark.parametrize("legacy_args", [False, True])
+    def test_direct_model_load_rejects_changed_gtp_topology(self, saved_shards, requested_shards, legacy_args):
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        saved_model_config = {
+            "tensor_model_parallel_size": 1,
+            "expert_tensor_parallel_size": 1,
+            "tensor_parallel_num_weight_shards": saved_shards,
+        }
+        requested_config = SimpleNamespace(
+            **{**saved_model_config, "tensor_parallel_num_weight_shards": requested_shards}
+        )
+        model = Mock(config=requested_config)
+        common_state = {"args": SimpleNamespace(**saved_model_config)} if legacy_args else {}
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing") as checkpointing,
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=not legacy_args),
+            patch(
+                "megatron.bridge.training.checkpointing.read_run_config", return_value={"model": saved_model_config}
+            ),
+            patch("megatron.bridge.training.checkpointing.restore_modelopt_state") as restore_modelopt,
+        ):
+            checkpointing.load_common_state_dict.return_value = common_state
+            with pytest.raises(ValueError, match="Resharding a GTP checkpoint"):
+                _load_model_weights_from_checkpoint("/checkpoint", [model])
+        checkpointing.load.assert_not_called()
+        restore_modelopt.assert_not_called()
+        model.load_state_dict.assert_not_called()
+
+    def test_direct_gtp_load_requires_saved_topology(self):
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        model = Mock(config=SimpleNamespace(tensor_parallel_num_weight_shards=2))
+        with (
+            patch("megatron.bridge.training.checkpointing.dist_checkpointing") as checkpointing,
+            patch("megatron.bridge.training.checkpointing.file_exists", return_value=False),
+        ):
+            checkpointing.load_common_state_dict.return_value = {}
+            with pytest.raises(ValueError, match="requires saved model configuration"):
+                _load_model_weights_from_checkpoint("/checkpoint", [model])
+        checkpointing.load.assert_not_called()
+
+    @pytest.fixture
+    def mock_model(self):
+        """Create a mock model for testing."""
+        model = Mock()
+        model.parameters.return_value = []
+        model.sharded_state_dict.return_value = {"weight": torch.randn(10, 10)}
+        return [model]
+
+    @pytest.fixture
+    def mock_multiple_models(self):
+        """Create multiple mock models for testing."""
+        model1 = Mock()
+        model1.parameters.return_value = []
+        model1.sharded_state_dict.return_value = {"weight1": torch.randn(10, 10)}
+        model2 = Mock()
+        model2.parameters.return_value = []
+        model2.sharded_state_dict.return_value = {"weight2": torch.randn(5, 5)}
+        return [model1, model2]
+
+    @pytest.fixture
+    def mock_common_state_dict(self):
+        """Create a mock state dict for testing."""
+        return {
+            "checkpoint_version": 3.0,
+            "iteration": 1000,
+            "optimizer": {"optimizer": {"param_groups": []}},
+            "opt_param_scheduler": {"max_lr": 0.001},
+        }
+
+    @pytest.fixture
+    def mock_full_state_dict(self):
+        """Create a mock state dict for testing."""
+        return {
+            "checkpoint_version": 3.0,
+            "iteration": 1000,
+            "optimizer": {"optimizer": {"param_groups": []}},
+            "opt_param_scheduler": {"max_lr": 0.001},
+            "model": {"weight": torch.randn(10, 10)},
+            "model0": {"weight1": torch.randn(10, 10)},
+            "model1": {"weight2": torch.randn(5, 5)},
+        }
+
+    @pytest.fixture
+    def mock_metadata(self):
+        """Create mock metadata for testing."""
+        return {"distrib_optim_sharding_type": "fully_sharded_model_space"}
+
+    @pytest.mark.parametrize("fully_parallel_load", [False, True])
+    @pytest.mark.parametrize("gtp_group_state", ["present", "none", "absent"])
+    @pytest.mark.parametrize("has_metadata", [False, True])
+    def test_load_model_weights_checkpoint_group_metadata(
+        self, fully_parallel_load, gtp_group_state, has_metadata, mock_model, mock_common_state_dict
+    ):
+        from megatron.bridge.training import checkpointing
+
+        pg_collection = SimpleNamespace(dp_cp=object())
+        if gtp_group_state != "absent":
+            pg_collection.dp_cp_gtp_remat = object() if gtp_group_state == "present" else None
+        expected_group = pg_collection.dp_cp_gtp_remat if gtp_group_state == "present" else pg_collection.dp_cp
+        metadata = (
+            {"distrib_optim_sharding_type": "fully_sharded_model_space", "dp_cp_group": object()}
+            if has_metadata
+            else None
+        )
+        original_metadata = dict(metadata) if metadata is not None else None
+        expected_metadata = dict(metadata or {}, dp_cp_group=expected_group)
+
+        with (
+            patch.object(checkpointing, "dist_checkpointing") as mock_dist_ckpt,
+            patch.object(checkpointing, "restore_modelopt_state"),
+            patch.object(checkpointing, "unwrap_model", return_value=mock_model),
+            patch.object(checkpointing, "get_pg_collection", return_value=pg_collection),
+            patch.object(checkpointing, "_generate_model_state_dict") as mock_generate,
+            patch.object(checkpointing, "TorchDistLoadShardedStrategy") as mock_strategy,
+            patch.object(checkpointing, "FullyParallelLoadStrategyWrapper") as mock_wrapper,
+            patch.object(checkpointing, "delete_extra_state"),
+        ):
+            mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+            mock_dist_ckpt.load_content_metadata.return_value = metadata
+            checkpointing._load_model_weights_from_checkpoint(
+                "/test/checkpoint", mock_model, fully_parallel_load=fully_parallel_load, return_state_dict=True
+            )
+
+        mock_generate.assert_called_once_with(mock_model, {"metadata": expected_metadata}, pg_collection=pg_collection)
+        assert metadata == original_metadata
+        if fully_parallel_load:
+            mock_wrapper.assert_called_once_with(mock_strategy.return_value, expected_group)
+        else:
+            mock_wrapper.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing._load_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.FullyParallelLoadStrategyWrapper")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    def test_load_model_weights_single_model_with_strictness_diagnostics(
+        self,
+        mock_get_pg_collection,
+        mock_fully_parallel_wrapper,
+        mock_strategy_cls,
+        mock_load_state_dict,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_model,
+        mock_common_state_dict,
+        mock_full_state_dict,
+        mock_metadata,
+    ):
+        """Test loading a model when strictness also returns diagnostics."""
+        # Setup mocks
+        mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_dist_ckpt.load.return_value = (mock_full_state_dict, set(), set())
+        mock_strategy_cls.return_value = Mock()
+        mock_generate_state_dict.return_value = {"model": {"weight": torch.randn(10, 10)}}
+        mock_unwrap_model.return_value = mock_model
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat = Mock()
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Call the function
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        with (
+            patch("megatron.bridge.training.checkpointing.gc.collect") as mock_gc_collect,
+            patch("megatron.bridge.training.checkpointing.torch.cuda.is_available", return_value=True),
+            patch("megatron.bridge.training.checkpointing.torch.cuda.empty_cache") as mock_empty_cache,
+        ):
+            _load_model_weights_from_checkpoint(
+                checkpoint_path="/test/checkpoint",
+                model=mock_model,
+                fully_parallel_load=False,
+                dist_ckpt_strictness="return_all",
+                strict=True,
+            )
+
+        # Verify calls
+        mock_dist_ckpt.load_common_state_dict.assert_called_once_with("/test/checkpoint")
+        mock_dist_ckpt.load_content_metadata.assert_called_once_with(preloaded_state_dict=mock_common_state_dict)
+        mock_unwrap_model.assert_called_once_with(mock_model)
+        mock_generate_state_dict.assert_called_once()
+        call_args = mock_generate_state_dict.call_args
+        assert call_args[0][1] == {"metadata": dict(mock_metadata, dp_cp_group=mock_pg_collection.dp_cp_gtp_remat)}
+        mock_strategy_cls.assert_called_once_with()
+        mock_load_state_dict.assert_called_once_with(mock_model[0], mock_full_state_dict["model"], True)
+        mock_gc_collect.assert_called_once_with()
+        mock_empty_cache.assert_called_once_with()
+
+    @patch("megatron.bridge.training.checkpointing.delete_extra_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_load_model_weights_calls_delete_extra_state(
+        self,
+        mock_strategy_cls,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_delete_extra_state,
+        mock_model,
+        mock_common_state_dict,
+        mock_full_state_dict,
+        mock_metadata,
+    ):
+        """Ensure extra state cleanup is invoked on the loaded state dict."""
+        mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_dist_ckpt.load.return_value = mock_full_state_dict
+        mock_strategy_cls.return_value = Mock()
+        mock_generate_state_dict.return_value = {"model": {"weight": torch.randn(1)}}
+        mock_unwrap_model.return_value = mock_model
+
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        _load_model_weights_from_checkpoint(
+            checkpoint_path="/ckpt",
+            model=mock_model,
+            fully_parallel_load=False,
+            dist_ckpt_strictness="assume_ok_unexpected",
+            strict=True,
+        )
+
+        mock_delete_extra_state.assert_called_once_with(mock_full_state_dict)
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing._load_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.FullyParallelLoadStrategyWrapper")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    def test_load_model_weights_multiple_models_success(
+        self,
+        mock_get_pg_collection,
+        mock_fully_parallel_wrapper,
+        mock_strategy_cls,
+        mock_load_state_dict,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_multiple_models,
+        mock_common_state_dict,
+        mock_full_state_dict,
+        mock_metadata,
+    ):
+        """Test successful loading of weights for multiple models."""
+        # Setup mocks
+        mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_dist_ckpt.load.return_value = mock_full_state_dict
+        mock_strategy_cls.return_value = Mock()
+        mock_generate_state_dict.return_value = {
+            "model0": {"weight1": torch.randn(10, 10)},
+            "model1": {"weight2": torch.randn(5, 5)},
+        }
+        mock_unwrap_model.return_value = mock_multiple_models
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat = Mock()
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Call the function
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        _load_model_weights_from_checkpoint(
+            checkpoint_path="/test/checkpoint",
+            model=mock_multiple_models,
+            fully_parallel_load=False,
+            dist_ckpt_strictness="assume_ok_unexpected",
+            strict=True,
+        )
+
+        # Verify calls
+        mock_dist_ckpt.load_common_state_dict.assert_called_once_with("/test/checkpoint")
+        mock_dist_ckpt.load_content_metadata.assert_called_once_with(preloaded_state_dict=mock_common_state_dict)
+        mock_unwrap_model.assert_called_once_with(mock_multiple_models)
+        mock_generate_state_dict.assert_called_once()
+        mock_strategy_cls.assert_called_once_with()
+
+        # Verify both models were loaded
+        assert mock_load_state_dict.call_count == 2
+        mock_load_state_dict.assert_any_call(mock_multiple_models[0], mock_full_state_dict["model0"], True)
+        mock_load_state_dict.assert_any_call(mock_multiple_models[1], mock_full_state_dict["model1"], True)
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing._load_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.FullyParallelLoadStrategyWrapper")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    def test_load_model_weights_fully_parallel_load(
+        self,
+        mock_get_pg_collection,
+        mock_fully_parallel_wrapper,
+        mock_strategy_cls,
+        mock_load_state_dict,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_model,
+        mock_common_state_dict,
+        mock_metadata,
+    ):
+        """Test loading with fully parallel load enabled."""
+        # Setup mocks
+        mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_strategy = Mock()
+        mock_strategy_cls.return_value = mock_strategy
+        mock_fully_parallel_wrapper.return_value = Mock()
+        mock_generate_state_dict.return_value = {"model": {"weight": torch.randn(10, 10)}}
+        mock_unwrap_model.return_value = mock_model
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_dp_cp_group = Mock()
+        mock_pg_collection.dp_cp = mock_dp_cp_group
+        # The wrapper re-elects one writer per shard within the group it is given, so it must get
+        # the gtp_remat-INCLUSIVE group, not the gtp-excluded replicate group.
+        mock_dp_cp_gtp_remat_group = Mock()
+        mock_pg_collection.dp_cp_gtp_remat = mock_dp_cp_gtp_remat_group
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Call the function
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        _load_model_weights_from_checkpoint(
+            checkpoint_path="/test/checkpoint",
+            model=mock_model,
+            fully_parallel_load=True,
+            dist_ckpt_strictness="assume_ok_unexpected",
+            strict=True,
+        )
+
+        # Verify fully parallel wrapper was used with pg_collection.dp_cp_gtp_remat
+        mock_fully_parallel_wrapper.assert_called_once_with(mock_strategy, mock_dp_cp_gtp_remat_group)
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing._load_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.FullyParallelLoadStrategyWrapper")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    def test_load_model_weights_none_state_dict(
+        self,
+        mock_get_pg_collection,
+        mock_fully_parallel_wrapper,
+        mock_strategy_cls,
+        mock_load_state_dict,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_model,
+        mock_metadata,
+    ):
+        """Test loading when checkpoint returns None state dict."""
+        # Setup mocks
+        mock_dist_ckpt.load_common_state_dict.return_value = None
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_strategy_cls.return_value = Mock()
+        mock_generate_state_dict.return_value = {"model": {"weight": torch.randn(10, 10)}}
+        mock_unwrap_model.return_value = mock_model
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat = Mock()
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Call the function and expect assertion error
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        with pytest.raises(AssertionError):
+            _load_model_weights_from_checkpoint(
+                checkpoint_path="/test/checkpoint",
+                model=mock_model,
+                fully_parallel_load=False,
+                dist_ckpt_strictness="assume_ok_unexpected",
+                strict=True,
+            )
+
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing._generate_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing._load_model_state_dict")
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.FullyParallelLoadStrategyWrapper")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    def test_return_state_dict(
+        self,
+        mock_get_pg_collection,
+        mock_fully_parallel_wrapper,
+        mock_strategy_cls,
+        mock_load_state_dict,
+        mock_generate_state_dict,
+        mock_unwrap_model,
+        mock_dist_ckpt,
+        mock_model,
+        mock_common_state_dict,
+        mock_full_state_dict,
+        mock_metadata,
+    ):
+        """Test skip loading weights and return state dict."""
+        # Setup mocks
+        mock_dist_ckpt.load_common_state_dict.return_value = mock_common_state_dict
+        mock_dist_ckpt.load_content_metadata.return_value = mock_metadata
+        mock_dist_ckpt.load.return_value = mock_full_state_dict
+        mock_strategy_cls.return_value = Mock()
+        mock_generate_state_dict.return_value = {"model": {"weight": torch.randn(10, 10)}}
+        mock_unwrap_model.return_value = mock_model
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat = Mock()
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Call the function
+        from megatron.bridge.training.checkpointing import _load_model_weights_from_checkpoint
+
+        returned_sd = _load_model_weights_from_checkpoint(
+            checkpoint_path="/test/checkpoint",
+            model=mock_model,
+            fully_parallel_load=False,
+            return_state_dict=True,
+            dist_ckpt_strictness="assume_ok_unexpected",
+            strict=True,
+        )
+
+        # Verify calls
+        assert returned_sd == mock_full_state_dict
+        mock_dist_ckpt.load.assert_called_once()
+        mock_load_state_dict.assert_not_called()
+
+
+class TestLoadModelStateDictHelper:
+    """Tests for _load_model_state_dict strict fallback behavior and logging."""
+
+    @pytest.fixture(autouse=True)
+    def _disable_gtp_load_context(self, monkeypatch):
+        monkeypatch.setattr("megatron.core.tensor_parallel.gtp_api.HAVE_GTP", False)
+
+    @patch("megatron.core.tensor_parallel.gtp_api.gtp_native_fp8_load_context", create=True)
+    @patch("megatron.core.tensor_parallel.gtp_api.HAVE_GTP", True)
+    def test_load_model_state_dict_wraps_gtp_native_fp8_loads(self, mock_load_context):
+        module = Mock()
+        load_return = Mock(missing_keys=[], unexpected_keys=[])
+        module.load_state_dict.side_effect = [Exception("strict mismatch"), load_return]
+        contexts = [MagicMock(), MagicMock()]
+        mock_load_context.side_effect = contexts
+
+        _load_model_state_dict(module, {"w": 1}, strict=True)
+
+        assert mock_load_context.call_count == 2
+        mock_load_context.assert_any_call(module)
+        for context in contexts:
+            context.__enter__.assert_called_once_with()
+            context.__exit__.assert_called_once()
+
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    def test_load_model_state_dict_strict_fallback(self, mock_print_rank_0):
+        module = Mock()
+        load_return = Mock(missing_keys=["layer.weight"], unexpected_keys=[])
+        module.load_state_dict.side_effect = [Exception("boom"), load_return]
+
+        _load_model_state_dict(module, {"w": 1}, strict=True)
+
+        assert module.load_state_dict.call_count == 2
+        first_args, first_kwargs = module.load_state_dict.call_args_list[0]
+        second_args, second_kwargs = module.load_state_dict.call_args_list[1]
+        assert first_kwargs.get("strict") is True
+        assert second_kwargs.get("strict") is False
+        assert mock_print_rank_0.called
+
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    def test_load_model_state_dict_only_extra_state_keys_no_warning(self, mock_print_rank_0):
+        """When every mismatched key ends with '._extra_state', no warning is printed."""
+        module = Mock()
+        load_return = Mock(
+            missing_keys=["layer.self_attention._extra_state", "layer.mlp._extra_state"],
+            unexpected_keys=["encoder.norm._extra_state"],
+        )
+        module.load_state_dict.side_effect = [Exception("strict mismatch"), load_return]
+
+        _load_model_state_dict(module, {"w": 1}, strict=True)
+
+        assert module.load_state_dict.call_count == 2
+        mock_print_rank_0.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    def test_load_model_state_dict_mixed_keys_warns_non_extra_only(self, mock_print_rank_0):
+        """When some keys don't end with '._extra_state', warn with only those keys."""
+        module = Mock()
+        load_return = Mock(
+            missing_keys=["layer.self_attention._extra_state", "layer.weight"],
+            unexpected_keys=["encoder.norm._extra_state", "decoder.bias"],
+        )
+        err = Exception("strict mismatch")
+        module.load_state_dict.side_effect = [err, load_return]
+
+        _load_model_state_dict(module, {"w": 1}, strict=True)
+
+        assert module.load_state_dict.call_count == 2
+        assert mock_print_rank_0.call_count == 2
+        warning_call = mock_print_rank_0.call_args_list[0][0][0]
+        keys_call = mock_print_rank_0.call_args_list[1][0][0]
+        assert "Warning: Exception during strict loading:" in warning_call
+        assert "strict mismatch" in warning_call
+        assert "layer.weight" in keys_call
+        assert "decoder.bias" in keys_call
+        assert "._extra_state" not in keys_call
+
+    def test_load_model_state_dict_non_strict_raises(self):
+        module = Mock()
+        module.load_state_dict.side_effect = Exception("fail")
+
+        with pytest.raises(Exception):
+            _load_model_state_dict(module, {"w": 1}, strict=False)
+
+
+class TestMegatronLMCompatibility:
+    """Test Megatron-LM checkpoint compatibility features."""
+
+    def test_extract_megatron_lm_args_from_state_dict_success(self):
+        """Test successful extraction of Megatron-LM args."""
+        # Create a mock args object that mimics Megatron-LM argparse Namespace
+        mock_args = Mock()
+        mock_args.tensor_model_parallel_size = 2
+        mock_args.pipeline_model_parallel_size = 4
+        mock_args.encoder_tensor_model_parallel_size = 1
+        mock_args.encoder_pipeline_model_parallel_size = 2
+        mock_args.no_save_optim = False  # Will become save_optim = True
+        mock_args.no_save_rng = True  # Will become save_rng = False
+        mock_args.ckpt_fully_parallel_save = True
+        mock_args.data_parallel_random_init = True
+
+        state_dict = {"args": mock_args}
+
+        result = _extract_megatron_lm_args_from_state_dict(state_dict)
+
+        expected = {
+            "model": {
+                "tensor_model_parallel_size": 2,
+                "pipeline_model_parallel_size": 4,
+                "encoder_tensor_model_parallel_size": 1,
+                "encoder_pipeline_model_parallel_size": 2,
+            },
+            "checkpoint": {
+                "save_optim": True,  # Inverted from no_save_optim=False
+                "save_rng": False,  # Inverted from no_save_rng=True
+                "fully_parallel_save": True,
+            },
+            "rng": {"data_parallel_random_init": True},
+        }
+
+        assert result == expected
+
+    def test_extract_megatron_lm_args_preserves_gtp_topology(self):
+        args = SimpleNamespace(
+            tensor_model_parallel_size=2,
+            expert_tensor_parallel_size=1,
+            tensor_parallel_num_weight_shards=4,
+            expert_tensor_parallel_num_weight_shards=4,
+            gtp_weight_remat_size=2,
+            expert_gtp_weight_remat_size=4,
+        )
+        model_config = _extract_megatron_lm_args_from_state_dict({"args": args})["model"]
+        for name, value in vars(args).items():
+            assert model_config[name] == value
+
+    def test_extract_megatron_lm_args_from_state_dict_defaults(self):
+        """Test extraction with default values when args are missing."""
+
+        # Create a simple object that behaves like argparse.Namespace
+        # Only set the tensor_model_parallel_size, other attributes will be missing
+        class MinimalArgs:
+            def __init__(self):
+                self.tensor_model_parallel_size = 1
+                # Don't set other attributes - they will trigger AttributeError
+                # which makes getattr() return the default value
+
+        mock_args = MinimalArgs()
+        state_dict = {"args": mock_args}
+
+        result = _extract_megatron_lm_args_from_state_dict(state_dict)
+
+        expected = {
+            "model": {
+                "tensor_model_parallel_size": 1,
+                "pipeline_model_parallel_size": 1,  # default
+                "encoder_tensor_model_parallel_size": 0,  # default
+                "encoder_pipeline_model_parallel_size": 0,  # default
+            },
+            "checkpoint": {
+                "save_optim": True,  # default (no_save_optim=False)
+                "save_rng": True,  # default (no_save_rng=False)
+                "fully_parallel_save": False,  # default
+            },
+            "rng": {"data_parallel_random_init": False},
+        }
+
+        assert result == expected
+
+    def test_extract_megatron_lm_args_from_state_dict_missing_args(self):
+        """Test error when args are missing from state_dict."""
+        state_dict = {"model": "some_model"}  # No 'args' key
+
+        with pytest.raises(RuntimeError) as exc_info:
+            _extract_megatron_lm_args_from_state_dict(state_dict)
+
+        assert "Legacy checkpoint missing 'args' field" in str(exc_info.value)
+
+    @patch("megatron.bridge.training.checkpointing.read_metadata")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    def test_load_base_checkpoint_legacy_tracker(self, mock_file_exists, mock_read_metadata):
+        """Test loading checkpoint with legacy Megatron-LM tracker file."""
+        mock_cfg = Mock(spec=CheckpointConfig)
+        mock_cfg.non_persistent_ckpt_type = None
+        mock_cfg.exit_on_missing_checkpoint = False
+        mock_cfg.ckpt_step = None
+        mock_cfg.ckpt_format = "torch_dist"
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 1
+
+        # Mock file existence: NeMo-LM tracker doesn't exist, legacy tracker does
+        def mock_file_exists_side_effect(path):
+            if "latest_train_state.pt" in path:
+                return False
+            elif "latest_checkpointed_iteration.txt" in path:
+                return True
+            return False
+
+        mock_file_exists.side_effect = mock_file_exists_side_effect
+        mock_read_metadata.return_value = (1000, False)
+
+        with patch("megatron.bridge.training.checkpointing._get_non_persistent_iteration", return_value=-1):
+            with patch("megatron.bridge.training.checkpointing.dist_checkpointing") as mock_dist_ckpt:
+                mock_dist_ckpt.check_is_distributed_checkpoint.return_value = True
+                with patch("megatron.bridge.training.checkpointing._load_global_dist_base_checkpoint") as mock_load:
+                    mock_load.return_value = ({"test": "data"}, "/ckpt/path", False, CheckpointType.GLOBAL)
+
+                    result = _load_base_checkpoint("/test/dir", mock_cfg, rank0=True, pg_collection=mock_pg_collection)
+
+                    state_dict, checkpoint_name, release, ckpt_type = result
+                    assert state_dict == {"test": "data"}
+                    assert release is False
+                    assert ckpt_type == CheckpointType.GLOBAL
+
+                    # Verify legacy tracker was read
+                    mock_read_metadata.assert_called_once()
+
+    @patch("megatron.bridge.training.checkpointing._extract_megatron_lm_args_from_state_dict")
+    @patch("megatron.bridge.training.checkpointing.read_run_config")
+    @patch("os.path.exists")
+    def test_load_checkpoint_legacy_config_extraction(self, mock_exists, mock_read_config, mock_extract_args):
+        """Test checkpoint loading with legacy config extraction."""
+        # Mock that run_config.yaml doesn't exist (legacy checkpoint)
+        mock_exists.return_value = False
+
+        # Mock the extracted legacy config
+        mock_extract_args.return_value = {
+            "model": {"tensor_model_parallel_size": 2},
+            "checkpoint": {"save_optim": True, "save_rng": True},
+        }
+
+        state_dict = {"args": Mock(), "iteration": 1000}
+
+        # This would be called in the actual loading flow
+        with patch("megatron.bridge.training.checkpointing.print_rank_0"):
+            # Simulate the config loading logic
+            run_config_filename = "/fake/run_config.yaml"
+            if mock_exists(run_config_filename):
+                config = mock_read_config(run_config_filename)
+            else:
+                config = mock_extract_args(state_dict)
+
+            assert config["model"]["tensor_model_parallel_size"] == 2
+            assert config["checkpoint"]["save_optim"] is True
+            mock_extract_args.assert_called_once_with(state_dict)
+            mock_read_config.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False)
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.checkpoint_exists")
+    @patch("megatron.bridge.training.checkpointing.set_checkpoint_version")
+    @patch("megatron.bridge.training.checkpointing.update_num_microbatches")
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.barrier")
+    @patch("torch.cuda.empty_cache")
+    @patch("os.path.exists")
+    def test_load_checkpoint_full_legacy_integration(
+        self,
+        mock_exists,
+        mock_empty_cache,
+        mock_barrier,
+        mock_dist_init,
+        mock_dist_ckpt,
+        mock_get_rng_state,
+        mock_generate_state_dict,
+        mock_rerun_machine,
+        mock_get_pg_collection,
+        mock_print_rank_0,
+        mock_is_last_rank,
+        mock_wandb,
+        mock_update_microbatches,
+        mock_set_version,
+        mock_exists_checkpoint,
+        mock_unwrap,
+        mock_load_base,
+        mock_is_hf_checkpoint_dir,
+    ):
+        """Test complete integration of loading a Megatron-LM checkpoint."""
+        # Setup for legacy checkpoint loading
+        mock_dist_init.return_value = False
+        mock_is_last_rank.return_value = False
+        mock_exists_checkpoint.return_value = True
+        mock_unwrap.return_value = [Mock()]
+        mock_unwrap.return_value[0].parameters.return_value = []
+
+        # Mock file existence checks
+        def mock_exists_side_effect(path):
+            if "run_config.yaml" in path:
+                return False  # No run_config.yaml (legacy)
+            elif "train_state.pt" in path:
+                return False  # No train_state.pt (legacy)
+            return True
+
+        mock_exists.side_effect = mock_exists_side_effect
+
+        # Create a complete legacy Megatron-LM state_dict
+        mock_args = Mock()
+        mock_args.tensor_model_parallel_size = 2
+        mock_args.pipeline_model_parallel_size = 1
+        mock_args.encoder_tensor_model_parallel_size = 0
+        mock_args.encoder_pipeline_model_parallel_size = 0
+        mock_args.no_save_optim = False
+        mock_args.no_save_rng = False
+        mock_args.ckpt_fully_parallel_save = True
+        mock_args.consumed_train_samples = 100000
+        mock_args.skipped_train_samples = 50
+        mock_args.consumed_valid_samples = 10000
+
+        legacy_state_dict = {
+            "checkpoint_version": 3.0,
+            "iteration": 2000,
+            "args": mock_args,
+            "num_floating_point_operations_so_far": 5000000,
+            "model": {"param": "value"},
+            "optimizer": {"param_groups": []},
+            "opt_param_scheduler": {"scheduler_state": "test"},  # Add scheduler state
+        }
+
+        mock_load_base.return_value = (legacy_state_dict, "/legacy/ckpt/path", False, CheckpointType.GLOBAL)
+
+        # Mock other required functions
+        mock_generate_state_dict.return_value = {"test": "state"}
+        mock_get_rng_state.return_value = Mock()
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 2
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # Legacy checkpoints predate content metadata in the common state.
+        mock_dist_ckpt.load_content_metadata.return_value = None
+        mock_dist_ckpt.load.return_value = {}
+
+        mock_rerun_machine.return_value.load_state_dict = Mock()
+
+        # Create test fixtures
+        mock_state = Mock()
+        mock_state.train_state = Mock()
+        mock_state.train_state.consumed_train_samples = 0
+        mock_state.train_state.skipped_train_samples = 0
+        mock_state.train_state.consumed_valid_samples = 0
+        mock_state.wandb_logger = Mock()
+
+        mock_cfg = Mock()
+        mock_cfg.scheduler = SchedulerConfig()
+        mock_cfg.ddp = DistributedDataParallelConfig()
+        mock_cfg.checkpoint = Mock()
+        mock_cfg.checkpoint.load = "/legacy/checkpoint"
+        mock_cfg.checkpoint.pretrained_checkpoint = None
+        mock_cfg.checkpoint.finetune = False
+        mock_cfg.checkpoint.load_optim = True
+        mock_cfg.checkpoint.load_rng = False  # Skip RNG loading for this test
+        mock_cfg.checkpoint.ckpt_format = "torch_dist"  # Set format explicitly
+        mock_cfg.checkpoint.stage_precision_aware_optimizer_state_on_cpu = True
+        mock_cfg.model = Mock()
+        mock_cfg.model.fp16 = False
+        mock_cfg.model.bf16 = False
+        mock_cfg.model.tensor_model_parallel_size = 2  # Should match checkpoint
+        mock_cfg.model.pipeline_model_parallel_size = 1  # Should match checkpoint
+        mock_cfg.rng = Mock()
+        mock_cfg.rng.data_parallel_random_init = False
+        mock_cfg.optimizer = Mock()
+        mock_cfg.optimizer.use_distributed_optimizer = False
+        mock_cfg.peft = None  # No PEFT for this test
+        mock_cfg.dist = Mock()
+        mock_cfg.dist.use_decentralized_pg = False
+
+        mock_state.cfg = mock_cfg
+
+        # Create mocks with necessary methods
+        mock_model = Mock()
+        mock_model.load_state_dict = Mock()
+
+        mock_optimizer = Mock()
+        mock_optimizer.load_state_dict = Mock()
+        mock_optimizer.is_stub_optimizer = False
+
+        mock_scheduler = Mock()
+        mock_scheduler.load_state_dict = Mock()
+
+        # Call load_checkpoint
+        with patch(
+            "megatron.bridge.training.checkpointing.memory_efficient_precision_aware_optimizer_state_checkpointing"
+        ) as mock_cpu_staging:
+            result = load_checkpoint(
+                mock_state,
+                [mock_model],  # model
+                mock_optimizer,  # optimizer
+                mock_scheduler,  # scheduler
+            )
+
+        # Verify the results
+        iteration, flops = result
+        assert iteration == 2000
+        assert flops == 5000000
+
+        # Verify that the legacy train state was created correctly
+        train_state = mock_state.train_state
+        assert train_state.step == 2000
+        assert train_state.consumed_train_samples == 100000
+        assert train_state.skipped_train_samples == 50
+        assert train_state.consumed_valid_samples == 10000
+        assert train_state.floating_point_operations_so_far == 5000000
+        assert train_state.do_train is False
+        assert train_state.do_valid is False
+        assert train_state.do_test is False
+
+        # Verify checkpoint version was set
+        mock_set_version.assert_called_with(3.0)
+        mock_cpu_staging.assert_called_once_with(mock_optimizer, enabled=True)
+
+
+class TestGetTrainStateFromStateDict:
+    """Test _get_train_state_from_state_dict function."""
+
+    def test_get_train_state_complete_state_dict(self):
+        """Test creating TrainState from a complete state_dict."""
+        # Create a mock args object
+        mock_args = Mock()
+        mock_args.consumed_train_samples = 150000
+        mock_args.skipped_train_samples = 250
+        mock_args.consumed_valid_samples = 12000
+
+        state_dict = {
+            "iteration": 3000,
+            "args": mock_args,
+            "num_floating_point_operations_so_far": 7500000,
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Verify all fields are set correctly
+        assert result.step == 3000
+        assert result.consumed_train_samples == 150000
+        assert result.skipped_train_samples == 250
+        assert result.consumed_valid_samples == 12000
+        assert result.floating_point_operations_so_far == 7500000
+        assert result.do_train is False
+        assert result.do_valid is False
+        assert result.do_test is False
+
+    def test_get_train_state_missing_iteration(self):
+        """Test creating TrainState when iteration is missing."""
+        mock_args = Mock()
+        mock_args.consumed_train_samples = 100000
+        mock_args.skipped_train_samples = 50
+        mock_args.consumed_valid_samples = 8000
+
+        state_dict = {
+            "args": mock_args,
+            "num_floating_point_operations_so_far": 5000000,
+            # No 'iteration' key
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should use default value of 0 for missing iteration
+        assert result.step == 0
+        assert result.consumed_train_samples == 100000
+        assert result.skipped_train_samples == 50
+        assert result.consumed_valid_samples == 8000
+        assert result.floating_point_operations_so_far == 5000000
+
+    def test_get_train_state_missing_args(self):
+        """Test creating TrainState when args is missing."""
+        state_dict = {
+            "iteration": 2000,
+            "num_floating_point_operations_so_far": 4000000,
+            # No 'args' key
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should use fallback default values for sample counts
+        assert result.step == 2000
+        assert result.consumed_train_samples == 0  # fallback
+        assert result.skipped_train_samples == 0  # fallback
+        assert result.consumed_valid_samples == 0  # fallback
+        assert result.floating_point_operations_so_far == 4000000
+
+    def test_get_train_state_missing_flops(self):
+        """Test creating TrainState when floating point operations count is missing."""
+        mock_args = Mock()
+        mock_args.consumed_train_samples = 75000
+        mock_args.skipped_train_samples = 30
+        mock_args.consumed_valid_samples = 6000
+
+        state_dict = {
+            "iteration": 1500,
+            "args": mock_args,
+            # No 'num_floating_point_operations_so_far' key
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should use default value of 0 for missing FLOPS
+        assert result.step == 1500
+        assert result.consumed_train_samples == 75000
+        assert result.skipped_train_samples == 30
+        assert result.consumed_valid_samples == 6000
+        assert result.floating_point_operations_so_far == 0  # default
+
+    def test_get_train_state_partial_args(self):
+        """Test creating TrainState when args has only some attributes."""
+
+        # Create args object with only some attributes set
+        class PartialArgs:
+            def __init__(self):
+                self.consumed_train_samples = 200000
+                # Don't set skipped_train_samples or consumed_valid_samples
+                # getattr() will return default values
+
+        partial_args = PartialArgs()
+
+        state_dict = {
+            "iteration": 4000,
+            "args": partial_args,
+            "num_floating_point_operations_so_far": 9000000,
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should use available attribute and defaults for missing ones
+        assert result.step == 4000
+        assert result.consumed_train_samples == 200000  # from args
+        assert result.skipped_train_samples == 0  # default from getattr
+        assert result.consumed_valid_samples == 0  # default from getattr
+        assert result.floating_point_operations_so_far == 9000000
+
+    def test_get_train_state_empty_state_dict(self):
+        """Test creating TrainState from an empty state_dict."""
+        state_dict = {}
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should use all default values
+        assert result.step == 0
+        assert result.consumed_train_samples == 0
+        assert result.skipped_train_samples == 0
+        assert result.consumed_valid_samples == 0
+        assert result.floating_point_operations_so_far == 0
+        assert result.do_train is False
+        assert result.do_valid is False
+        assert result.do_test is False
+
+    def test_get_train_state_args_none(self):
+        """Test creating TrainState when args is explicitly None."""
+        state_dict = {
+            "iteration": 500,
+            "args": None,
+            "num_floating_point_operations_so_far": 1000000,
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should trigger the fallback branch (args is None)
+        assert result.step == 500
+        assert result.consumed_train_samples == 0  # fallback
+        assert result.skipped_train_samples == 0  # fallback
+        assert result.consumed_valid_samples == 0  # fallback
+        assert result.floating_point_operations_so_far == 1000000
+
+    def test_get_train_state_large_values(self):
+        """Test creating TrainState with large numerical values."""
+        mock_args = Mock()
+        mock_args.consumed_train_samples = 999999999
+        mock_args.skipped_train_samples = 1000000
+        mock_args.consumed_valid_samples = 50000000
+
+        state_dict = {
+            "iteration": 100000,
+            "args": mock_args,
+            "num_floating_point_operations_so_far": 999999999999,
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should handle large values correctly
+        assert result.step == 100000
+        assert result.consumed_train_samples == 999999999
+        assert result.skipped_train_samples == 1000000
+        assert result.consumed_valid_samples == 50000000
+        assert result.floating_point_operations_so_far == 999999999999
+
+    def test_get_train_state_zero_values(self):
+        """Test creating TrainState with zero values."""
+        mock_args = Mock()
+        mock_args.consumed_train_samples = 0
+        mock_args.skipped_train_samples = 0
+        mock_args.consumed_valid_samples = 0
+
+        state_dict = {
+            "iteration": 0,
+            "args": mock_args,
+            "num_floating_point_operations_so_far": 0,
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Should handle zero values correctly
+        assert result.step == 0
+        assert result.consumed_train_samples == 0
+        assert result.skipped_train_samples == 0
+        assert result.consumed_valid_samples == 0
+        assert result.floating_point_operations_so_far == 0
+        # Boolean flags should still be False
+        assert result.do_train is False
+        assert result.do_valid is False
+        assert result.do_test is False
+
+    def test_get_train_state_boolean_flags_always_true(self):
+        """Test that boolean flags are always set to False regardless of input."""
+        # Even with different inputs, the boolean flags should always be False
+        state_dict = {
+            "iteration": 1000,
+            "do_train": False,  # This should be ignored
+            "do_valid": False,  # This should be ignored
+            "do_test": False,  # This should be ignored
+        }
+
+        from megatron.bridge.training.checkpointing import _get_train_state_from_state_dict
+
+        result = _get_train_state_from_state_dict(state_dict)
+
+        # Boolean flags should always be False (hardcoded in the function)
+        assert result.do_train is False
+        assert result.do_valid is False
+        assert result.do_test is False
+
+
+class TestCheckpointIterationResolution:
+    """Test checkpoint iteration resolution logic."""
+
+    def test_inprocess_restart_refreshes_mutable_bridge_tracker(self, tmp_path):
+        """Restart teardown must invalidate a cached tracker overwritten by a later save."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        tracker = get_checkpoint_train_state_filename(str(tmp_path), prefix="latest")
+        first_state = TrainState(step=5)
+        torch.save(first_state.state_dict(), tracker)
+        assert _resolve_checkpoint_iteration(str(tmp_path), None) == (5, False)
+
+        latest_state = TrainState(step=10)
+        torch.save(latest_state.state_dict(), tracker)
+        GlobalState().reset_for_restart()
+
+        assert _resolve_checkpoint_iteration(str(tmp_path), None) == (10, False)
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    def test_loads_from_bridge_tracker(self, mock_read_train_state, mock_file_exists):
+        """Should read iteration from Bridge format tracker file."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_file_exists.return_value = True
+        train_state = TrainState()
+        train_state.step = 1000
+        mock_read_train_state.return_value = train_state
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/checkpoints",
+            ckpt_step_override=None,
+        )
+
+        assert iteration == 1000
+        assert release is False
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.read_metadata")
+    def test_fallback_to_legacy_tracker(self, mock_read_metadata, mock_file_exists):
+        """Should fallback to legacy format when Bridge format not found."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        def file_exists_side_effect(path):
+            # Bridge format doesn't exist, legacy does
+            return "latest_checkpointed_iteration.txt" in path
+
+        mock_file_exists.side_effect = file_exists_side_effect
+        mock_read_metadata.return_value = (2000, False)
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/checkpoints",
+            ckpt_step_override=None,
+        )
+
+        assert iteration == 2000
+        assert release is False
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    def test_ckpt_step_validates_existence(self, mock_read_train_state, mock_file_exists):
+        """ckpt_step should validate checkpoint directory exists."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_file_exists.return_value = True  # Checkpoint dir exists
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/checkpoints",
+            ckpt_step_override=5000,
+        )
+
+        assert iteration == 5000
+        assert release is False
+        # Verify we checked if checkpoint dir exists (but not tracker file)
+        mock_file_exists.assert_called_once()
+        assert "/checkpoints/iter_0005000" in str(mock_file_exists.call_args)
+        mock_read_train_state.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    def test_ckpt_step_raises_if_not_exists(self, mock_file_exists):
+        """ckpt_step should raise FileNotFoundError if checkpoint directory doesn't exist."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_file_exists.return_value = False  # Checkpoint dir doesn't exist
+
+        with pytest.raises(FileNotFoundError) as exc_info:
+            _resolve_checkpoint_iteration(
+                load_dir="/checkpoints",
+                ckpt_step_override=3000,
+            )
+
+        assert "ckpt_step=3000 specified but checkpoint directory does not exist" in str(exc_info.value)
+        assert "/checkpoints/iter_0003000" in str(exc_info.value)
+        assert "ls /checkpoints/iter_*" in str(exc_info.value)
+
+    def test_ckpt_step_validation_in_config_finalize(self):
+        """ckpt_step without load should raise ValueError during config finalize."""
+        from megatron.bridge.training.config import CheckpointConfig
+
+        config = CheckpointConfig(
+            ckpt_step=3000,
+            load=None,  # Missing load directory
+        )
+
+        with pytest.raises(ValueError) as exc_info:
+            config.finalize()
+
+        assert "ckpt_step=3000 specified but checkpoint.load is None" in str(exc_info.value)
+        assert "Please set checkpoint.load to the base checkpoint directory" in str(exc_info.value)
+
+    def test_ckpt_step_with_only_pretrained_raises(self):
+        """ckpt_step with only pretrained_checkpoint should raise because pretrained path does not exist."""
+        from megatron.bridge.training.config import CheckpointConfig
+
+        config = CheckpointConfig(
+            ckpt_step=5000,
+            load=None,
+            pretrained_checkpoint="/pretrained/model",  # Has pretrained but no load
+        )
+
+        with pytest.raises(AssertionError, match="Pretrained checkpoint /pretrained/model does not exist"):
+            config.finalize()
+
+    def test_no_load_dir_returns_default(self):
+        """When load_dir is None, should return iteration=-1."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir=None,
+            ckpt_step_override=None,
+        )
+
+        assert iteration == -1
+        assert release is False
+
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    def test_ignore_ckpt_step_loads_latest(self, mock_read_train_state, mock_file_exists):
+        """When ignore_ckpt_step=True via load path, should load latest even if ckpt_step is set in config."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_file_exists.return_value = True
+        train_state = TrainState()
+        train_state.step = 9999  # Latest checkpoint
+        mock_read_train_state.return_value = train_state
+
+        # Pass None to _resolve_checkpoint_iteration (simulating ignore_ckpt_step=True)
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/pretrained",
+            ckpt_step_override=None,  # Passed as None when ignore_ckpt_step=True
+        )
+
+        # Should load latest (9999), not ckpt_step value
+        assert iteration == 9999
+        assert release is False
+
+    @patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory")
+    def test_direct_iteration_directory_returns_sentinel(self, mock_is_iter_dir):
+        """When load_dir is already an iteration directory, should return the sentinel value."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_is_iter_dir.return_value = True
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/checkpoints/iter_0001000",
+            ckpt_step_override=None,
+        )
+
+        assert iteration == _DIRECT_ITERATION_DIR_SENTINEL
+        assert release is False
+        mock_is_iter_dir.assert_called_once_with("/checkpoints/iter_0001000")
+
+    @patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory")
+    def test_direct_iteration_directory_ignores_ckpt_step(self, mock_is_iter_dir):
+        """Iteration directory detection takes priority over ckpt_step_override."""
+        from megatron.bridge.training.checkpointing import _resolve_checkpoint_iteration
+
+        mock_is_iter_dir.return_value = True
+
+        iteration, release = _resolve_checkpoint_iteration(
+            load_dir="/checkpoints/iter_0001000",
+            ckpt_step_override=5000,
+        )
+
+        assert iteration == _DIRECT_ITERATION_DIR_SENTINEL
+        assert release is False
+
+
+class TestFSDPDTensorFunctionality:
+    """Test new FSDP DTensor checkpointing functionality."""
+
+    @patch("megatron.core.dist_checkpointing.check_is_distributed_checkpoint")
+    @patch("os.path.exists")
+    def test_get_checkpoint_format_torch_dist(self, mock_exists, mock_check_dist_ckpt):
+        """Test _get_checkpoint_format detects torch_dist format."""
+        mock_check_dist_ckpt.return_value = True
+        mock_exists.return_value = False
+
+        result = _get_checkpoint_format("/path/to/checkpoint")
+
+        assert result == "torch_dist"
+        mock_check_dist_ckpt.assert_called_once_with("/path/to/checkpoint")
+
+    @patch("megatron.core.dist_checkpointing.check_is_distributed_checkpoint")
+    @patch("os.path.exists")
+    def test_get_checkpoint_format_fsdp_dtensor(self, mock_exists, mock_check_dist_ckpt):
+        """Test _get_checkpoint_format detects fsdp_dtensor format."""
+        mock_check_dist_ckpt.return_value = False
+        mock_exists.return_value = True  # .metadata file exists
+
+        result = _get_checkpoint_format("/path/to/checkpoint")
+
+        assert result == "fsdp_dtensor"
+        mock_check_dist_ckpt.assert_called_once_with("/path/to/checkpoint")
+        mock_exists.assert_called_once_with("/path/to/checkpoint/.metadata")
+
+    @patch("megatron.core.dist_checkpointing.check_is_distributed_checkpoint")
+    @patch("os.path.exists")
+    def test_get_checkpoint_format_unknown(self, mock_exists, mock_check_dist_ckpt):
+        """Test _get_checkpoint_format raises error for unknown format."""
+        mock_check_dist_ckpt.return_value = False
+        mock_exists.return_value = False  # No .metadata file
+
+        with pytest.raises(NotImplementedError, match="Unknown checkpoint format"):
+            _get_checkpoint_format("/path/to/checkpoint")
+
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    def test_get_rng_state_fsdp_dtensor_format(self, mock_dist_init, mock_tp):
+        """Test get_rng_state returns correct format for fsdp_dtensor."""
+        mock_dist_init.return_value = False  # Simplify
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 1
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+
+        with (
+            patch("random.getstate"),
+            patch("numpy.random.get_state"),
+            patch("torch.get_rng_state"),
+            patch("torch.cuda.get_rng_state"),
+        ):
+            result = get_rng_state(
+                data_parallel_random_init=False, ckpt_format="fsdp_dtensor", pg_collection=mock_pg_collection
+            )
+
+        # Should return dict format for fsdp_dtensor
+        assert isinstance(result, dict)
+        assert "(0, 0)" in result
+
+    @patch("megatron.bridge.training.checkpointing.tensor_parallel")
+    @patch("torch.distributed.is_initialized")
+    def test_get_rng_state_torch_dist_format(self, mock_dist_init, mock_tp):
+        """Test get_rng_state returns ShardedObject for torch_dist."""
+        mock_dist_init.return_value = False
+        mock_tracker = Mock()
+        mock_tracker.get_states.return_value = "tracker_states"
+        mock_tp.get_cuda_rng_tracker.return_value = mock_tracker
+
+        # Create mock pg_collection
+        mock_pg_collection = Mock()
+        mock_pg_collection.gtp_remat = None
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.size.return_value = 1
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+
+        with (
+            patch("random.getstate"),
+            patch("numpy.random.get_state"),
+            patch("torch.get_rng_state"),
+            patch("torch.cuda.get_rng_state"),
+            patch("megatron.bridge.training.checkpointing.ShardedObject") as mock_sharded_obj,
+        ):
+            _ = get_rng_state(
+                data_parallel_random_init=False, ckpt_format="torch_dist", pg_collection=mock_pg_collection
+            )
+
+        # Should create ShardedObject for torch_dist format
+        # The exact arguments depend on the RNG state, but we just verify it was called
+        mock_sharded_obj.assert_called_once()
+
+    def test_build_sharded_state_dict_metadata_fsdp_dtensor(self):
+        """Test _build_sharded_state_dict_metadata for fsdp_dtensor format."""
+        from megatron.bridge.training.checkpointing import _build_sharded_state_dict_metadata
+
+        ckpt_cfg = CheckpointConfig(fully_parallel_save=False, ckpt_format="fsdp_dtensor")
+        result = _build_sharded_state_dict_metadata(use_distributed_optimizer=True, cfg=ckpt_cfg)
+
+        assert result["distrib_optim_sharding_type"] == "fsdp_dtensor"
+        assert result["chained_optim_avoid_prefix"] is True
+        assert result["singleton_local_shards"] is False
+
+    def test_build_sharded_state_dict_metadata_torch_dist_fully_parallel(self):
+        """Test _build_sharded_state_dict_metadata for torch_dist with fully parallel save."""
+        from megatron.bridge.training.checkpointing import _build_sharded_state_dict_metadata
+
+        ckpt_cfg = CheckpointConfig(fully_parallel_save=True, ckpt_format="torch_dist")
+        result = _build_sharded_state_dict_metadata(use_distributed_optimizer=True, cfg=ckpt_cfg)
+
+        assert result["distrib_optim_sharding_type"] == "dp_reshardable"
+
+    def test_build_sharded_state_dict_metadata_torch_dist_dp_zero(self):
+        """Test _build_sharded_state_dict_metadata for torch_dist with dp_zero_gather_scatter."""
+        from megatron.bridge.training.checkpointing import _build_sharded_state_dict_metadata
+
+        ckpt_cfg = CheckpointConfig(fully_parallel_save=False, ckpt_format="torch_dist")
+        result = _build_sharded_state_dict_metadata(use_distributed_optimizer=True, cfg=ckpt_cfg)
+
+        assert result["distrib_optim_sharding_type"] == "dp_reshardable"
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
+    @patch("torch.distributed.checkpoint.FileSystemReader")
+    @patch("torch.distributed.checkpoint.load_state_dict")
+    @patch("torch.distributed.checkpoint.default_planner.DefaultLoadPlanner")
+    def test_load_fsdp_dtensor_checkpoint_rank0(self, mock_planner, mock_load_state_dict, mock_reader):
+        """Test load_fsdp_dtensor_checkpoint for rank0."""
+        from megatron.bridge.training.checkpointing import load_fsdp_dtensor_checkpoint
+        from megatron.bridge.training.config import CheckpointConfig
+
+        ckpt_cfg = CheckpointConfig()
+
+        state_dict, checkpoint_name, release, ckpt_type = load_fsdp_dtensor_checkpoint(
+            load_dir="/test/dir",
+            ckpt_cfg=ckpt_cfg,
+            rank0=True,
+            sharded_state_dict=None,
+            iteration=1000,
+            release=False,
+        )
+
+        # For rank0, should return empty state dict
+        assert state_dict == {}
+        assert ckpt_type == CheckpointType.FSDP_DTENSOR
+        assert release is False
+        # Should not call any loading functions for rank0
+        mock_reader.assert_not_called()
+        mock_load_state_dict.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", False)
+    def test_load_fsdp_dtensor_checkpoint_no_fsdp(self):
+        """Test load_fsdp_dtensor_checkpoint raises error when FSDP not available."""
+        from megatron.bridge.training.checkpointing import load_fsdp_dtensor_checkpoint
+        from megatron.bridge.training.config import CheckpointConfig
+
+        ckpt_cfg = CheckpointConfig()
+
+        with pytest.raises(RuntimeError, match="Megatron FSDP is required but not available"):
+            load_fsdp_dtensor_checkpoint(
+                load_dir="/test/dir",
+                ckpt_cfg=ckpt_cfg,
+                rank0=False,
+                sharded_state_dict={},
+                iteration=1000,
+                release=False,
+            )
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
+    def test_generate_state_dict_fsdp_dtensor_no_preprocessing(self):
+        """Test generate_state_dict does NOT apply FSDP DTensor preprocessing."""
+        from unittest.mock import Mock
+
+        from megatron.bridge.training.checkpointing import generate_state_dict
+        from megatron.bridge.training.config import CheckpointConfig
+
+        # Create mock model
+        mock_model = Mock()
+        mock_model.state_dict_for_save_checkpoint.return_value = {"test_param": torch.tensor([1.0])}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.handle_fp8_extra_state_case") as mock_fp8,
+            patch("megatron.bridge.training.checkpointing.preprocess_state_dict_for_uneven_dtensor") as mock_uneven,
+        ):
+            ckpt_cfg = CheckpointConfig(ckpt_format="fsdp_dtensor", save_rng=False)
+            result = generate_state_dict(
+                ckpt_cfg=ckpt_cfg,
+                model=[mock_model],
+                optimizer=None,
+                opt_param_scheduler=None,
+                rng_state=None,
+            )
+
+            # Should NOT call FSDP preprocessing functions (moved to preprocess_fsdp_dtensor_state_dict)
+            mock_fp8.assert_not_called()
+            mock_uneven.assert_not_called()
+            # Should use state_dict_for_save_checkpoint for fsdp_dtensor
+            mock_model.state_dict_for_save_checkpoint.assert_called_once()
+            assert "model" in result
+            assert result["checkpoint_version"] == (
+                3.1 if hasattr(distrib_optimizer, "get_legacy_grad_dtypes") else 3.0
+            )
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
+    def test_preprocess_fsdp_dtensor_state_dict(self):
+        """Test preprocess_fsdp_dtensor_state_dict applies all preprocessing steps."""
+        from unittest.mock import Mock
+
+        from megatron.bridge.training.checkpointing import preprocess_fsdp_dtensor_state_dict
+
+        # Create mock model and config
+        mock_model = Mock()
+        mock_cfg = Mock()
+
+        # Mock model config without swiglu or experts
+        with patch("megatron.core.utils.get_model_config") as mock_get_config:
+            mock_model_config = Mock()
+            mock_model_config.gated_linear_unit = False
+            mock_model_config.num_moe_experts = None
+            mock_get_config.return_value = mock_model_config
+
+            with (
+                patch("megatron.bridge.training.checkpointing.handle_fp8_extra_state_case") as mock_fp8,
+                patch(
+                    "megatron.bridge.training.checkpointing.preprocess_state_dict_for_uneven_dtensor"
+                ) as mock_uneven,
+                patch("megatron.bridge.training.checkpointing.handle_gdn_in_state_dict", None),
+                patch("megatron.bridge.training.checkpointing.handle_mla_down_proj_in_state_dict", None),
+                patch("megatron.bridge.training.checkpointing.handle_mtp_in_state_dict", None),
+            ):
+                raw_state_dict = {"model": {"test_param": torch.tensor([1.0])}}
+                result = preprocess_fsdp_dtensor_state_dict(mock_cfg, raw_state_dict, mock_model)
+
+                # Should call FP8 and uneven dtensor preprocessing
+                mock_fp8.assert_called_once()
+                mock_uneven.assert_called_once()
+                assert "model" in result
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
+    def test_save_fsdp_dtensor_checkpoint_preprocesses_and_saves(self, tmp_path):
+        """Test public FSDP DTensor save helper preprocesses and calls PyTorch DCP."""
+        from megatron.bridge.training.checkpointing import save_fsdp_dtensor_checkpoint
+
+        checkpoint_path = tmp_path / "iter_0000001"
+        raw_state_dict = {"model": {"test_param": torch.tensor([1.0])}}
+        preprocessed_state_dict = {"model": {"test_param": torch.tensor([2.0])}}
+        cfg = Mock()
+        model = Mock()
+        writer = Mock()
+        save_result = object()
+
+        with (
+            patch(
+                "megatron.bridge.training.checkpointing.preprocess_fsdp_dtensor_state_dict",
+                return_value=preprocessed_state_dict,
+            ) as mock_preprocess,
+            patch("megatron.bridge.training.checkpointing.MultiStorageClientFeature.is_enabled", return_value=False),
+            patch("torch.distributed.checkpoint.FileSystemWriter", return_value=writer) as mock_writer_cls,
+            patch("torch.distributed.checkpoint.save", return_value=save_result) as mock_save,
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.barrier") as mock_barrier,
+        ):
+            result = save_fsdp_dtensor_checkpoint(checkpoint_path, raw_state_dict, cfg=cfg, model=model)
+
+        assert result is save_result
+        mock_preprocess.assert_called_once_with(cfg, raw_state_dict, model)
+        mock_writer_cls.assert_called_once_with(str(checkpoint_path))
+        mock_save.assert_called_once_with(state_dict=preprocessed_state_dict, storage_writer=writer)
+        mock_barrier.assert_called_once()
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", False)
+    def test_save_fsdp_dtensor_checkpoint_requires_megatron_fsdp(self, tmp_path):
+        """Test public FSDP DTensor save helper reports missing Megatron FSDP."""
+        from megatron.bridge.training.checkpointing import save_fsdp_dtensor_checkpoint
+
+        with pytest.raises(RuntimeError, match="Megatron FSDP is required but not available"):
+            save_fsdp_dtensor_checkpoint(tmp_path, {"model": {}}, cfg=Mock(), model=Mock())
+
+    def test_generate_state_dict_torch_dist_no_preprocessing(self):
+        """Test generate_state_dict skips FSDP preprocessing for torch_dist."""
+        from unittest.mock import Mock
+
+        from megatron.bridge.training.checkpointing import generate_state_dict
+        from megatron.bridge.training.config import CheckpointConfig
+
+        mock_model = Mock()
+        mock_model.sharded_state_dict.return_value = {"test_param": torch.tensor([1.0])}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.handle_fp8_extra_state_case") as mock_fp8,
+            patch("megatron.bridge.training.checkpointing.preprocess_state_dict_for_uneven_dtensor") as mock_uneven,
+        ):
+            ckpt_cfg = CheckpointConfig(ckpt_format="torch_dist", save_rng=False)
+            result = generate_state_dict(
+                ckpt_cfg=ckpt_cfg,
+                model=[mock_model],
+                optimizer=None,
+                opt_param_scheduler=None,
+                rng_state=None,
+            )
+
+            # Should NOT call FSDP preprocessing functions for torch_dist
+            mock_fp8.assert_not_called()
+            mock_uneven.assert_not_called()
+            # Should use sharded_state_dict for torch_dist
+            mock_model.sharded_state_dict.assert_called_once()
+            assert "model" in result
+            assert result["checkpoint_version"] == (
+                3.1 if hasattr(distrib_optimizer, "get_legacy_grad_dtypes") else 3.0
+            )
+
+    @pytest.mark.parametrize("cpu_staging", [False, True])
+    def test_generate_state_dict_includes_optimizer_scaffold_when_loading(self, cpu_staging):
+        """Load-time optimizer scaffolding should not depend on save_optim."""
+        from unittest.mock import Mock
+
+        from megatron.bridge.training.checkpointing import generate_state_dict
+        from megatron.bridge.training.config import CheckpointConfig
+
+        mock_model = Mock()
+        mock_model.sharded_state_dict.return_value = {"test_param": torch.tensor([1.0])}
+        mock_optimizer = Mock()
+        mock_optimizer.is_stub_optimizer = False
+        mock_optimizer.sharded_state_dict.return_value = {"optimizer": {"param_groups": []}}
+        mock_scheduler = Mock()
+        mock_scheduler.state_dict.return_value = {"scheduler": "state"}
+
+        ckpt_cfg = CheckpointConfig(
+            ckpt_format="torch_dist",
+            save_optim=False,
+            save_rng=False,
+            stage_precision_aware_optimizer_state_on_cpu=cpu_staging,
+        )
+        with patch(
+            "megatron.bridge.training.checkpointing.memory_efficient_precision_aware_optimizer_state_checkpointing"
+        ) as mock_cpu_staging:
+            result = generate_state_dict(
+                ckpt_cfg=ckpt_cfg,
+                model=[mock_model],
+                optimizer=mock_optimizer,
+                opt_param_scheduler=mock_scheduler,
+                rng_state=None,
+                optim_sd_kwargs={
+                    "is_loading": True,
+                    "metadata": {"distrib_optim_sharding_type": "dp_zero_gather_scatter"},
+                },
+            )
+
+        assert result["optimizer"] == {"optimizer": {"param_groups": []}}
+        assert result["opt_param_scheduler"] == {"scheduler": "state"}
+        mock_cpu_staging.assert_called_once_with(mock_optimizer, enabled=cpu_staging)
+        mock_optimizer.sharded_state_dict.assert_called_once()
+
+    @pytest.mark.parametrize("ckpt_format", ["torch_dist", "fsdp_dtensor"])
+    @pytest.mark.parametrize(
+        "is_loading,has_rng_scaffold,expected_rng_state",
+        [(True, True, True), (True, False, False), (False, True, False)],
+    )
+    def test_generate_state_dict_includes_rng_scaffold_only_when_loading(
+        self, ckpt_format, is_loading, has_rng_scaffold, expected_rng_state
+    ):
+        """Load-time RNG scaffolding should not depend on save_rng."""
+        from megatron.bridge.training.checkpointing import generate_state_dict
+
+        mock_model = Mock()
+        mock_model.sharded_state_dict.return_value = {"test_param": torch.tensor([1.0])}
+        mock_model.state_dict_for_save_checkpoint.return_value = {"test_param": torch.tensor([1.0])}
+        mock_rng_state = Mock() if has_rng_scaffold else None
+        optim_sd_kwargs = {"is_loading": True} if is_loading else None
+
+        ckpt_cfg = CheckpointConfig(ckpt_format=ckpt_format, save_rng=False)
+        result = generate_state_dict(
+            ckpt_cfg=ckpt_cfg,
+            model=[mock_model],
+            optimizer=None,
+            opt_param_scheduler=None,
+            rng_state=mock_rng_state,
+            optim_sd_kwargs=optim_sd_kwargs,
+        )
+
+        assert ("rng_state" in result) is expected_rng_state
+        if expected_rng_state:
+            assert result["rng_state"] is mock_rng_state
+
+
+class TestCheckpointPathOverride:
+    """Test checkpoint_path_override parameter in loading functions."""
+
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    def test_load_global_dist_uses_override_rank0(self, mock_dist_ckpt, mock_strategy_cls):
+        """rank0 path should use checkpoint_path_override instead of find_checkpoint_rank_0."""
+        from megatron.bridge.training.checkpointing import _load_global_dist_base_checkpoint
+
+        mock_dist_ckpt.load_common_state_dict.return_value = {"test": "data"}
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+
+        state_dict, checkpoint_name, release, ckpt_type = _load_global_dist_base_checkpoint(
+            load_dir="/should/not/be/used",
+            ckpt_cfg=CheckpointConfig(),
+            rank0=True,
+            sharded_state_dict=None,
+            iteration=None,
+            release=False,
+            checkpoint_path_override="/direct/iter_0001000",
+            pg_collection=mock_pg,
+        )
+
+        assert checkpoint_name == "/direct/iter_0001000"
+        assert ckpt_type == CheckpointType.GLOBAL
+        mock_dist_ckpt.load_common_state_dict.assert_called_once_with("/direct/iter_0001000")
+        mock_strategy_cls.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    def test_load_global_dist_uses_override_non_rank0(self, mock_dist_ckpt, mock_strategy_cls):
+        """Non-rank0 path should use checkpoint_path_override instead of get_checkpoint_name."""
+        from megatron.bridge.training.checkpointing import _load_global_dist_base_checkpoint
+
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.load.return_value = {"model": "sharded_data"}
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+        mock_pg.dp_cp_gtp_remat = Mock()
+
+        sharded_sd = {"weight": "placeholder"}
+        state_dict, checkpoint_name, release, ckpt_type = _load_global_dist_base_checkpoint(
+            load_dir="/should/not/be/used",
+            ckpt_cfg=CheckpointConfig(),
+            rank0=False,
+            sharded_state_dict=sharded_sd,
+            iteration=None,
+            release=False,
+            checkpoint_path_override="/direct/iter_0001000",
+            pg_collection=mock_pg,
+        )
+
+        assert checkpoint_name == "/direct/iter_0001000"
+        mock_strategy_cls.assert_called_once_with()
+        mock_dist_ckpt.load.assert_called_once()
+        load_call_args = mock_dist_ckpt.load.call_args
+        assert load_call_args[0][1] == "/direct/iter_0001000"
+
+    @pytest.mark.parametrize("strictness", ["return_unexpected", "return_all"])
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    def test_load_global_dist_unwraps_strictness_result(self, mock_dist_ckpt, mock_strategy_cls, strictness):
+        """Strictness diagnostics must not replace the loaded state dictionary."""
+        from megatron.bridge.training.checkpointing import _load_global_dist_base_checkpoint
+
+        loaded_state_dict = {"checkpoint_version": 3.0, "model": {}}
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.load.return_value = (loaded_state_dict, set(), set())
+        mock_pg = Mock()
+        mock_pg.dp_cp = Mock()
+
+        state_dict, _, _, _ = _load_global_dist_base_checkpoint(
+            load_dir="/checkpoints",
+            ckpt_cfg=CheckpointConfig(dist_ckpt_strictness=strictness),
+            rank0=False,
+            sharded_state_dict={"model": {}},
+            iteration=1000,
+            release=False,
+            pg_collection=mock_pg,
+        )
+
+        assert state_dict.get("checkpoint_version") == 3.0
+        assert mock_dist_ckpt.load.call_args.kwargs["strict"] == strictness
+
+    @patch("megatron.bridge.training.checkpointing.HAVE_MEGATRON_FSDP", True)
+    def test_load_fsdp_dtensor_uses_override_rank0(self):
+        """rank0 path should use checkpoint_path_override instead of get_checkpoint_name."""
+        from megatron.bridge.training.checkpointing import load_fsdp_dtensor_checkpoint
+
+        state_dict, checkpoint_name, release, ckpt_type = load_fsdp_dtensor_checkpoint(
+            load_dir="/should/not/be/used",
+            ckpt_cfg=CheckpointConfig(),
+            rank0=True,
+            sharded_state_dict=None,
+            iteration=None,
+            release=False,
+            checkpoint_path_override="/direct/iter_0001000",
+        )
+
+        assert checkpoint_name == "/direct/iter_0001000"
+        assert state_dict == {}
+        assert ckpt_type == CheckpointType.FSDP_DTENSOR
+
+
+class TestLoadCheckpointFromPathDirectIterDir:
+    """Test _load_checkpoint_from_path with a direct iteration directory (fsdp_dtensor path).
+
+    Checkpoint source selection happens before the FSDP-specific metadata
+    preparation. We verify that a selected iteration directory is passed
+    directly to the filesystem reader.
+    """
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.core.dist_checkpointing.strategies.torch.FileSystemReader")
+    def test_fsdp_dtensor_skips_tracker_resolution(self, mock_reader, mock_unwrap, mock_get_pg):
+        """When load_dir is an iteration directory, FileSystemReader should receive it directly."""
+        from megatron.core.msc_utils import MultiStorageClientFeature
+
+        from megatron.bridge.training.checkpointing import _load_checkpoint_from_path
+
+        MultiStorageClientFeature.disable()
+
+        mock_metadata = Mock()
+        mock_metadata.state_dict_metadata = {}
+        mock_reader_instance = Mock()
+        mock_reader_instance.read_metadata.return_value = mock_metadata
+        mock_reader.return_value = mock_reader_instance
+
+        mock_model = Mock()
+        mock_unwrap.return_value = [mock_model]
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+        mock_pg.dp_cp_gtp_remat = Mock()
+        mock_get_pg.return_value = mock_pg
+
+        mock_cfg = Mock()
+        mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+        mock_cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        mock_cfg.checkpoint.finetune = True
+        mock_cfg.checkpoint.load_rng = False
+        mock_cfg.checkpoint.load_optim = False
+        mock_cfg.checkpoint.ckpt_step = None
+        mock_cfg.checkpoint.load = None
+        mock_cfg.checkpoint.pretrained_checkpoint = None
+        mock_cfg.optimizer = Mock()
+        mock_cfg.optimizer.use_distributed_optimizer = False
+        mock_cfg.peft = None
+        mock_cfg.rng = Mock()
+
+        mock_state = Mock(spec=GlobalState)
+        mock_state.cfg = mock_cfg
+
+        with (
+            patch("megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}),
+            patch("megatron.bridge.training.checkpointing._build_sharded_state_dict_metadata", return_value={}),
+            patch("megatron.bridge.training.checkpointing._load_base_checkpoint") as mock_load_base,
+            patch("megatron.bridge.training.checkpointing.set_checkpoint_version"),
+        ):
+            mock_load_base.return_value = (
+                {"model": {}, "checkpoint_version": 3.0},
+                "/ckpt/iter_0001000",
+                False,
+                CheckpointType.FSDP_DTENSOR,
+            )
+
+            _load_checkpoint_from_path(
+                load_dir="/ckpt/iter_0001000",
+                state=mock_state,
+                model=[mock_model],
+                optimizer=None,
+                opt_param_scheduler=None,
+                skip_load_to_model_and_opt=True,
+            )
+
+            # The fsdp_dtensor prep block should have called FileSystemReader
+            # with the direct path (not a tracker-resolved path).
+            mock_reader.assert_called_once_with("/ckpt/iter_0001000")
+
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.file_exists")
+    @patch("megatron.bridge.training.checkpointing.is_checkpoint_iteration_directory")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.core.dist_checkpointing.strategies.torch.FileSystemReader")
+    def test_fsdp_dtensor_ckpt_step_prepares_requested_iteration(
+        self,
+        mock_reader,
+        mock_unwrap,
+        mock_get_pg,
+        mock_is_iter_dir,
+        mock_file_exists,
+        mock_read_train_state,
+    ):
+        """FSDP metadata and payload loading must use the explicitly requested iteration."""
+        from megatron.core.msc_utils import MultiStorageClientFeature
+
+        from megatron.bridge.training.checkpointing import _load_checkpoint_from_path
+
+        MultiStorageClientFeature.disable()
+        mock_is_iter_dir.return_value = False
+        mock_file_exists.side_effect = lambda path: path.endswith("latest_train_state.pt")
+        mock_read_train_state.return_value = TrainState(step=200)
+
+        mock_metadata = Mock()
+        mock_metadata.state_dict_metadata = {}
+        mock_reader_instance = Mock()
+        mock_reader_instance.read_metadata.return_value = mock_metadata
+        mock_reader.return_value = mock_reader_instance
+
+        mock_model = Mock()
+        mock_unwrap.return_value = [mock_model]
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+        mock_pg.dp_cp_gtp_remat = Mock()
+        mock_get_pg.return_value = mock_pg
+
+        mock_cfg = Mock()
+        mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+        mock_cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        mock_cfg.checkpoint.finetune = True
+        mock_cfg.checkpoint.load_rng = False
+        mock_cfg.checkpoint.load_optim = False
+        mock_cfg.checkpoint.ckpt_step = 100
+        mock_cfg.checkpoint.load = "/ckpt"
+        mock_cfg.checkpoint.pretrained_checkpoint = None
+        mock_cfg.optimizer = Mock()
+        mock_cfg.optimizer.use_distributed_optimizer = False
+        mock_cfg.peft = None
+        mock_cfg.rng = Mock()
+
+        mock_state = Mock(spec=GlobalState)
+        mock_state.cfg = mock_cfg
+
+        with (
+            patch("megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}),
+            patch("megatron.bridge.training.checkpointing._build_sharded_state_dict_metadata", return_value={}),
+            patch("megatron.bridge.training.checkpointing._load_base_checkpoint") as mock_load_base,
+            patch("megatron.bridge.training.checkpointing.set_checkpoint_version"),
+        ):
+            mock_load_base.return_value = (
+                {"model": {}, "checkpoint_version": 3.0},
+                "/ckpt/iter_0000100",
+                False,
+                CheckpointType.FSDP_DTENSOR,
+            )
+
+            _load_checkpoint_from_path(
+                load_dir="/ckpt",
+                state=mock_state,
+                model=[mock_model],
+                optimizer=None,
+                opt_param_scheduler=None,
+                skip_load_to_model_and_opt=True,
+            )
+
+        mock_reader.assert_called_once_with("/ckpt/iter_0000100")
+
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("multistorageclient.torch.MultiStorageFileSystemReader")
+    def test_fsdp_dtensor_skips_tracker_resolution_with_msc(self, mock_reader, mock_unwrap, mock_get_pg):
+        """When load_dir is an iteration directory, FileSystemReader should receive it directly."""
+        from megatron.core.msc_utils import MultiStorageClientFeature
+
+        from megatron.bridge.training.checkpointing import _load_checkpoint_from_path
+
+        MultiStorageClientFeature.enable()
+
+        mock_metadata = Mock()
+        mock_metadata.state_dict_metadata = {}
+        mock_reader_instance = Mock()
+        mock_reader_instance.read_metadata.return_value = mock_metadata
+        mock_reader.return_value = mock_reader_instance
+
+        mock_model = Mock()
+        mock_unwrap.return_value = [mock_model]
+        mock_pg = Mock()
+        mock_pg.gtp_remat = None
+        mock_pg.expt_gtp_remat = None
+        mock_pg.dp_cp_gtp_remat = Mock()
+        mock_get_pg.return_value = mock_pg
+
+        mock_cfg = Mock()
+        mock_cfg.checkpoint = Mock(spec=CheckpointConfig)
+        mock_cfg.checkpoint.ckpt_format = "fsdp_dtensor"
+        mock_cfg.checkpoint.finetune = True
+        mock_cfg.checkpoint.load_rng = False
+        mock_cfg.checkpoint.load_optim = False
+        mock_cfg.checkpoint.ckpt_step = None
+        mock_cfg.checkpoint.load = None
+        mock_cfg.checkpoint.pretrained_checkpoint = None
+        mock_cfg.optimizer = Mock()
+        mock_cfg.optimizer.use_distributed_optimizer = False
+        mock_cfg.peft = None
+        mock_cfg.rng = Mock()
+
+        mock_state = Mock(spec=GlobalState)
+        mock_state.cfg = mock_cfg
+
+        with (
+            patch("megatron.bridge.training.checkpointing.generate_state_dict", return_value={"model": {}}),
+            patch("megatron.bridge.training.checkpointing._build_sharded_state_dict_metadata", return_value={}),
+            patch("megatron.bridge.training.checkpointing._load_base_checkpoint") as mock_load_base,
+            patch("megatron.bridge.training.checkpointing.set_checkpoint_version"),
+        ):
+            mock_load_base.return_value = (
+                {"model": {}, "checkpoint_version": 3.0},
+                "/ckpt/iter_0001000",
+                False,
+                CheckpointType.FSDP_DTENSOR,
+            )
+
+            _load_checkpoint_from_path(
+                load_dir="/ckpt/iter_0001000",
+                state=mock_state,
+                model=[mock_model],
+                optimizer=None,
+                opt_param_scheduler=None,
+                skip_load_to_model_and_opt=True,
+            )
+
+            # The fsdp_dtensor prep block should have called FileSystemReader
+            # with the direct path (not a tracker-resolved path).
+            mock_reader.assert_called_once_with("/ckpt/iter_0001000", thread_count=2)
+
+
+class TestCheckpointManager:
+    """Tests for the CheckpointManager interface and DefaultCheckpointManager."""
+
+    def test_checkpoint_save_context_creation(self):
+        """Test CheckpointSaveContext dataclass can be created with required fields."""
+        mock_state = Mock(spec=GlobalState)
+        mock_model = [Mock()]
+        mock_optimizer = Mock()
+        mock_scheduler = Mock()
+
+        ctx = CheckpointSaveContext(
+            state=mock_state,
+            model=mock_model,
+            optimizer=mock_optimizer,
+            opt_param_scheduler=mock_scheduler,
+            num_floating_point_operations_so_far=1000,
+        )
+
+        assert ctx.state is mock_state
+        assert ctx.model is mock_model
+        assert ctx.optimizer is mock_optimizer
+        assert ctx.opt_param_scheduler is mock_scheduler
+        assert ctx.num_floating_point_operations_so_far == 1000
+        assert ctx.train_data_iterator is None
+        assert ctx.non_persistent_ckpt is False
+
+    def test_checkpoint_save_context_with_optional_fields(self):
+        """Test CheckpointSaveContext with optional fields set."""
+        mock_state = Mock(spec=GlobalState)
+        mock_iterator = Mock()
+
+        ctx = CheckpointSaveContext(
+            state=mock_state,
+            model=[Mock()],
+            optimizer=None,
+            opt_param_scheduler=None,
+            num_floating_point_operations_so_far=0,
+            train_data_iterator=mock_iterator,
+            non_persistent_ckpt=True,
+        )
+
+        assert ctx.train_data_iterator is mock_iterator
+        assert ctx.non_persistent_ckpt is True
+
+    def test_checkpoint_load_context_creation(self):
+        """Test CheckpointLoadContext dataclass can be created with required fields."""
+        mock_state = Mock(spec=GlobalState)
+        mock_model = [Mock()]
+        mock_optimizer = Mock()
+        mock_scheduler = Mock()
+
+        ctx = CheckpointLoadContext(
+            state=mock_state,
+            model=mock_model,
+            optimizer=mock_optimizer,
+            opt_param_scheduler=mock_scheduler,
+        )
+
+        assert ctx.state is mock_state
+        assert ctx.model is mock_model
+        assert ctx.optimizer is mock_optimizer
+        assert ctx.opt_param_scheduler is mock_scheduler
+        assert ctx.strict is True
+        assert ctx.skip_load_to_model_and_opt is False
+
+    def test_checkpoint_load_context_with_optional_fields(self):
+        """Test CheckpointLoadContext with optional fields set."""
+        mock_state = Mock(spec=GlobalState)
+
+        ctx = CheckpointLoadContext(
+            state=mock_state,
+            model=[Mock()],
+            optimizer=None,
+            opt_param_scheduler=None,
+            strict=False,
+            skip_load_to_model_and_opt=True,
+        )
+
+        assert ctx.strict is False
+        assert ctx.skip_load_to_model_and_opt is True
+
+    def test_create_checkpoint_manager_returns_default(self):
+        """Test create_checkpoint_manager returns DefaultCheckpointManager when no custom class."""
+        config = CheckpointConfig()
+
+        manager = create_checkpoint_manager(config)
+
+        assert isinstance(manager, DefaultCheckpointManager)
+        assert manager.checkpoint_config is config
+
+    def test_create_checkpoint_manager_invalid_format_raises(self):
+        """Test create_checkpoint_manager raises ValueError for invalid class format."""
+        config = CheckpointConfig(custom_manager_class="InvalidClassName")
+
+        with pytest.raises(ValueError, match="Invalid custom_manager_class format"):
+            create_checkpoint_manager(config)
+
+    def test_create_checkpoint_manager_missing_module_raises(self):
+        """Test create_checkpoint_manager raises ImportError for non-existent module."""
+        config = CheckpointConfig(custom_manager_class="megatron.bridge.nonexistent_module.ClassName")
+
+        with pytest.raises(ImportError, match="Could not import module"):
+            create_checkpoint_manager(config)
+
+    def test_create_checkpoint_manager_missing_class_raises(self):
+        """Test create_checkpoint_manager raises AttributeError for non-existent class."""
+        # Use a real module but non-existent class
+        config = CheckpointConfig(custom_manager_class="megatron.bridge.training.checkpointing.NonExistentClass")
+
+        with pytest.raises(AttributeError, match="does not have class"):
+            create_checkpoint_manager(config)
+
+    def test_create_checkpoint_manager_rejects_unallowed_custom_class_before_import(self):
+        """Test custom manager class paths are allowlist-validated before import."""
+        config = CheckpointConfig(custom_manager_class="attacker_pkg.manager.PayloadManager")
+
+        with patch("importlib.import_module") as mock_import:
+            with pytest.raises(InstantiationException, match="not in the allowlist"):
+                create_checkpoint_manager(config)
+
+        mock_import.assert_not_called()
+
+    def test_create_checkpoint_manager_custom_class(self):
+        """Test create_checkpoint_manager loads and instantiates a custom class."""
+
+        # Create a simple custom manager class for testing
+        class CustomTestManager:
+            def __init__(self, checkpoint_config):
+                self.checkpoint_config = checkpoint_config
+                self.initialized = True
+
+            def save(self, _ctx, _callback_manager):
+                pass
+
+            def load(self, _ctx):
+                return (0, 0)
+
+            def finalize_async_saves(self, state, blocking=False, terminate=False):
+                pass
+
+        # Patch the import to return our test class
+        with patch("importlib.import_module") as mock_import:
+            mock_module = Mock()
+            mock_module.CustomTestManager = CustomTestManager
+            mock_import.return_value = mock_module
+
+            config = CheckpointConfig(custom_manager_class="megatron.bridge.test.CustomTestManager")
+            manager = create_checkpoint_manager(config)
+
+            assert isinstance(manager, CustomTestManager)
+            assert manager.checkpoint_config is config
+            assert manager.initialized is True
+
+    def test_create_checkpoint_manager_rejects_incompatible_save_signature(self):
+        """Test custom managers must accept the callback manager used by training saves."""
+
+        class CustomTestManager:
+            def __init__(self, _checkpoint_config):
+                pass
+
+            def save(self, _ctx):
+                pass
+
+            def load(self, _ctx):
+                return (0, 0)
+
+            def finalize_async_saves(self, _state, blocking=False, terminate=False):
+                pass
+
+        with patch("importlib.import_module") as mock_import:
+            mock_module = Mock(CustomTestManager=CustomTestManager)
+            mock_import.return_value = mock_module
+            config = CheckpointConfig(custom_manager_class="megatron.bridge.test.CustomTestManager")
+
+            with pytest.raises(TypeError, match="save"):
+                create_checkpoint_manager(config)
+
+    def test_default_checkpoint_manager_init(self):
+        """Test DefaultCheckpointManager initialization."""
+        config = CheckpointConfig()
+
+        with patch("megatron.bridge.training.checkpointing.init_checkpointing_context") as mock_init_ctx:
+            mock_init_ctx.return_value = {"test_key": "test_value"}
+            manager = DefaultCheckpointManager(config)
+
+            assert manager.checkpoint_config is config
+            mock_init_ctx.assert_called_once_with(config)
+            assert manager.checkpointing_context == {"test_key": "test_value"}
+
+    def test_default_checkpoint_manager_save_delegates(self):
+        """Test DefaultCheckpointManager.save() delegates to save_checkpoint."""
+        config = CheckpointConfig()
+        mock_state = Mock(spec=GlobalState)
+        mock_model = [Mock()]
+        mock_optimizer = Mock()
+        mock_scheduler = Mock()
+
+        ctx = CheckpointSaveContext(
+            state=mock_state,
+            model=mock_model,
+            optimizer=mock_optimizer,
+            opt_param_scheduler=mock_scheduler,
+            num_floating_point_operations_so_far=5000,
+            train_data_iterator=Mock(),
+            non_persistent_ckpt=True,
+        )
+
+        with (
+            patch("megatron.bridge.training.checkpointing.init_checkpointing_context") as mock_init_ctx,
+            patch("megatron.bridge.training.checkpointing.save_checkpoint") as mock_save,
+        ):
+            mock_init_ctx.return_value = {"context": "data"}
+            manager = DefaultCheckpointManager(config)
+            manager.save(ctx, None)
+
+            mock_save.assert_called_once_with(
+                state=mock_state,
+                model=mock_model,
+                optimizer=mock_optimizer,
+                opt_param_scheduler=mock_scheduler,
+                num_floating_point_operations_so_far=5000,
+                checkpointing_context={"context": "data"},
+                non_persistent_ckpt=True,
+                train_data_iterator=ctx.train_data_iterator,
+                pg_collection=None,
+                callback_manager=None,
+                module_name=None,
+            )
+
+    def test_default_checkpoint_manager_load_delegates(self):
+        """Test DefaultCheckpointManager.load() delegates to load_checkpoint."""
+        config = CheckpointConfig()
+        mock_state = Mock(spec=GlobalState)
+        mock_model = [Mock()]
+        mock_optimizer = Mock()
+        mock_scheduler = Mock()
+
+        ctx = CheckpointLoadContext(
+            state=mock_state,
+            model=mock_model,
+            optimizer=mock_optimizer,
+            opt_param_scheduler=mock_scheduler,
+            strict=False,
+            skip_load_to_model_and_opt=True,
+        )
+
+        with (
+            patch("megatron.bridge.training.checkpointing.init_checkpointing_context") as mock_init_ctx,
+            patch("megatron.bridge.training.checkpointing.load_checkpoint") as mock_load,
+        ):
+            mock_init_ctx.return_value = {"context": "data"}
+            mock_load.return_value = (100, 50000)
+
+            manager = DefaultCheckpointManager(config)
+            result = manager.load(ctx)
+
+            mock_load.assert_called_once_with(
+                state=mock_state,
+                model=mock_model,
+                optimizer=mock_optimizer,
+                opt_param_scheduler=mock_scheduler,
+                strict=False,
+                checkpointing_context={"context": "data"},
+                skip_load_to_model_and_opt=True,
+                pg_collection=None,
+                module_name=None,
+            )
+            assert result == (100, 50000)
+
+    def test_default_checkpoint_manager_finalize_async_saves(self):
+        """Test DefaultCheckpointManager.finalize_async_saves() delegates correctly."""
+        config = CheckpointConfig()
+        mock_state = Mock(spec=GlobalState)
+
+        with (
+            patch("megatron.bridge.training.checkpointing.init_checkpointing_context") as mock_init_ctx,
+            patch("megatron.bridge.training.checkpointing.maybe_finalize_async_save") as mock_finalize,
+        ):
+            mock_init_ctx.return_value = {}
+
+            manager = DefaultCheckpointManager(config)
+            manager.finalize_async_saves(state=mock_state, blocking=True, terminate=True)
+
+            mock_finalize.assert_called_once_with(
+                global_state=mock_state,
+                ckpt_cfg=config,
+                blocking=True,
+                terminate=True,
+            )
+
+    def test_checkpoint_manager_protocol_compliance(self):
+        """Test that DefaultCheckpointManager satisfies the CheckpointManager protocol."""
+        config = CheckpointConfig()
+
+        with patch("megatron.bridge.training.checkpointing.init_checkpointing_context"):
+            manager = DefaultCheckpointManager(config)
+
+            # Protocol check using isinstance (works because @runtime_checkable)
+            assert isinstance(manager, CheckpointManager)
+
+    def test_checkpointing_context_property(self):
+        """Test DefaultCheckpointManager.checkpointing_context property."""
+        config = CheckpointConfig()
+        expected_context = {"local_checkpoint_manager": Mock(), "save_strategy": Mock()}
+
+        with patch("megatron.bridge.training.checkpointing.init_checkpointing_context") as mock_init_ctx:
+            mock_init_ctx.return_value = expected_context
+
+            manager = DefaultCheckpointManager(config)
+
+            assert manager.checkpointing_context is expected_context
+            assert manager._context is expected_context
+
+
+@pytest.mark.unit
+class TestLayerWiseOptimizerCheckpointing:
+    """Tests for LayerWiseDistributedOptimizer checkpoint save/load guards.
+
+    Covers the fix for https://github.com/NVIDIA-NeMo/Megatron-Bridge/issues/2805:
+    - save_checkpoint must NOT write layer_wise_optimizer_*.pt for torch_dist/fsdp_dtensor
+      formats because the optimizer state is already embedded in the distributed checkpoint.
+    - load_checkpoint must load layer_wise_optimizer_*.pt from the local checkpoint base
+      directory for LOCAL checkpoints.
+    """
+
+    # -----------------------------------------------------------------------
+    # Save-side tests
+    # -----------------------------------------------------------------------
+
+    @patch("megatron.bridge.training.checkpointing.wandb_utils")
+    @patch("megatron.bridge.training.checkpointing.is_last_rank")
+    @patch("builtins.open", new_callable=mock_open)
+    @patch("torch.save")
+    @patch("shutil.copy")
+    @patch("megatron.bridge.training.checkpointing.save_sharded_modelopt_state")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.fault_tolerance")
+    @patch("megatron.bridge.training.checkpointing.is_empty_async_queue")
+    @patch("megatron.bridge.training.checkpointing.get_rank_safe")
+    @patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.TorchDistSaveShardedStrategy")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("torch.distributed.is_initialized")
+    @patch("torch.distributed.get_rank")
+    @patch("torch.distributed.barrier")
+    def test_save_global_torch_dist_skips_layer_wise_files(
+        self,
+        mock_barrier,
+        mock_get_dist_rank,
+        mock_dist_init,
+        mock_print_rank_0,
+        mock_strategy_cls,
+        mock_ensure_dir,
+        mock_save_dataloader,
+        mock_get_rank_safe,
+        mock_empty_queue,
+        mock_ft,
+        mock_get_pg_collection,
+        mock_dist_ckpt,
+        mock_gen_state,
+        mock_rerun,
+        mock_get_rng,
+        mock_unwrap,
+        mock_save_modelopt,
+        mock_shutil_copy,
+        mock_torch_save,
+        mock_file_open,
+        mock_is_last_rank,
+        mock_wandb,
+        save_checkpoint_fixtures,
+    ):
+        """save_checkpoint must NOT write layer_wise_optimizer_*.pt for torch_dist format.
+
+        When ckpt_format is 'torch_dist' the optimizer state is already embedded in the
+        distributed checkpoint via optimizer.sharded_state_dict().  Writing separate per-rank
+        files is wasteful and they are never loaded on resume.
+        """
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        mock_layer_wise_optim = Mock(spec=LayerWiseDistributedOptimizer)
+        mock_layer_wise_optim.__class__ = LayerWiseDistributedOptimizer
+        mock_layer_wise_optim.is_stub_optimizer = False
+
+        mock_dist_init.return_value = True
+        mock_get_dist_rank.return_value = 0
+        mock_get_rank_safe.return_value = 0
+        mock_empty_queue.return_value = True
+        mock_unwrap.return_value = save_checkpoint_fixtures["mock_model"]
+        mock_get_rng.return_value = Mock()
+        mock_rerun.return_value.state_dict.return_value = {}
+        mock_gen_state.return_value = {"model": {"p": "v"}}
+        mock_is_last_rank.return_value = False
+        mock_strategy_cls.return_value = Mock()
+        mock_dist_ckpt.save.return_value = None
+        save_checkpoint_fixtures["mock_state"].wandb_logger = Mock()
+        save_checkpoint_fixtures["mock_state"].cfg.checkpoint.most_recent_k = -1
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.expt_dp.rank.return_value = 0
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 0
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        # ckpt_format is "torch_dist" (set in save_checkpoint_fixtures)
+        assert save_checkpoint_fixtures["mock_cfg"].checkpoint.ckpt_format == "torch_dist"
+
+        save_checkpoint(
+            save_checkpoint_fixtures["mock_state"],
+            save_checkpoint_fixtures["mock_model"],
+            mock_layer_wise_optim,
+            save_checkpoint_fixtures["mock_scheduler"],
+            1000000,
+            checkpointing_context={},
+            non_persistent_ckpt=False,
+        )
+
+        # For torch_dist format, save_state_dict_to_file must NOT be called.
+        mock_layer_wise_optim.save_state_dict_to_file.assert_not_called()
+
+    def test_save_local_checkpoint_uses_gtp_data_distribution_rank(self, save_checkpoint_fixtures):
+        """Local LayerWise checkpoint filenames include the GTP-remat rank."""
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        class StopAfterLayerWiseSave(Exception):
+            pass
+
+        cfg = save_checkpoint_fixtures["mock_cfg"]
+        cfg.model = Mock()
+        cfg.checkpoint.non_persistent_ckpt_type = "local"
+        cfg.checkpoint.save_rng = False
+
+        pg_collection = Mock()
+        pg_collection.dp.rank.return_value = 2
+        data_distribution_group = Mock()
+        data_distribution_group.rank.return_value = 5
+
+        local_checkpoint_manager = Mock()
+        local_checkpoint_manager.local_ckpt_dir = "/ckpts/local_nonpersistent"
+        checkpointing_context = {"local_checkpoint_manager": local_checkpoint_manager}
+
+        optimizer = Mock(spec=LayerWiseDistributedOptimizer)
+        optimizer.__class__ = LayerWiseDistributedOptimizer
+        optimizer.is_stub_optimizer = False
+        optimizer.save_state_dict_to_file.side_effect = StopAfterLayerWiseSave
+
+        rerun_state_machine = Mock()
+        rerun_state_machine.state_dict.return_value = {}
+
+        with (
+            patch("megatron.bridge.training.checkpointing.fault_tolerance.on_checkpointing_start"),
+            patch(
+                "megatron.bridge.training.checkpointing.unwrap_model",
+                return_value=save_checkpoint_fixtures["mock_model"],
+            ),
+            patch(
+                "megatron.bridge.training.checkpointing.get_rerun_state_machine",
+                return_value=rerun_state_machine,
+            ),
+            patch("megatron.bridge.training.checkpointing.maybe_save_dataloader_state"),
+            patch("megatron.bridge.training.checkpointing.ensure_directory_exists"),
+            patch(
+                "megatron.bridge.training.checkpointing.get_data_distribution_group",
+                return_value=data_distribution_group,
+            ) as mock_get_data_distribution_group,
+            pytest.raises(StopAfterLayerWiseSave),
+        ):
+            save_checkpoint(
+                save_checkpoint_fixtures["mock_state"],
+                save_checkpoint_fixtures["mock_model"],
+                optimizer,
+                save_checkpoint_fixtures["mock_scheduler"],
+                1000000,
+                checkpointing_context=checkpointing_context,
+                non_persistent_ckpt=True,
+                pg_collection=pg_collection,
+            )
+
+        mock_get_data_distribution_group.assert_called_once_with(pg_collection, cfg.model)
+        optimizer.save_state_dict_to_file.assert_called_once_with(
+            "/ckpts/local_nonpersistent/layer_wise_optimizer_5.pt"
+        )
+
+    # -----------------------------------------------------------------------
+    # Load-side tests
+    # -----------------------------------------------------------------------
+
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False)
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.read_run_config")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.checkpoint_exists")
+    @patch("megatron.bridge.training.checkpointing.set_checkpoint_version")
+    @patch("megatron.bridge.training.checkpointing.update_num_microbatches")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing._build_sharded_state_dict_metadata")
+    @patch("os.path.exists")
+    @patch("torch.distributed.is_initialized")
+    def test_load_local_checkpoint_calls_load_state_dict_from_file(
+        self,
+        mock_dist_init,
+        mock_exists_os,
+        mock_build_metadata,
+        mock_dist_ckpt,
+        mock_get_rng_state,
+        mock_generate_state_dict,
+        mock_rerun_machine,
+        mock_get_pg_collection,
+        mock_print_rank_0,
+        mock_update_microbatches,
+        mock_set_version,
+        mock_exists,
+        mock_unwrap,
+        mock_read_config,
+        mock_read_state,
+        mock_load_base,
+        mock_is_hf_checkpoint_dir,
+        load_checkpoint_fixtures,
+    ):
+        """load_checkpoint must call load_state_dict_from_file for LOCAL checkpoints.
+
+        For local (non-persistent) checkpoints the LayerWiseDistributedOptimizer state is
+        saved to a separate per-rank file in the local checkpoint base directory.
+        The load path must read that file back from local_checkpoint_manager.local_ckpt_dir.
+        """
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        mock_layer_wise_optim = Mock(spec=LayerWiseDistributedOptimizer)
+        mock_layer_wise_optim.__class__ = LayerWiseDistributedOptimizer
+        mock_layer_wise_optim.is_stub_optimizer = False
+
+        mock_dist_init.return_value = False
+        mock_exists.return_value = True
+        mock_exists_os.return_value = True
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+        mock_generate_state_dict.return_value = {"test": "state"}
+        mock_get_rng_state.return_value = Mock()
+        mock_build_metadata.return_value = {}
+        mock_dist_ckpt.load_content_metadata.return_value = {}
+        mock_dist_ckpt.load.return_value = {}
+        mock_rerun_machine.return_value.state_dict.return_value = {}
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 2  # non-zero to verify path construction
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_pg_collection.dp_cp.rank.return_value = 0
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        mock_data_distribution_group = Mock()
+        mock_data_distribution_group.rank.return_value = 5
+
+        mock_train_state = Mock()
+        mock_train_state.step = 500
+        mock_train_state.floating_point_operations_so_far = 0
+        mock_read_state.return_value = mock_train_state
+
+        mock_read_config.return_value = {
+            "model": {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1},
+            "checkpoint": {"save_rng": False, "save_optim": True, "fully_parallel_save": False},
+        }
+
+        mock_state_dict = {
+            "checkpoint_version": 3.0,
+            "model": {"param": "value"},
+            "opt_param_scheduler": {"max_lr": 0.001},
+        }
+        # Return CheckpointType.LOCAL to trigger the LayerWise load path
+        mock_load_base.return_value = (mock_state_dict, "/ckpts/local_ckpt_id", False, CheckpointType.LOCAL)
+
+        local_ckpt_dir = "/ckpts/local_nonpersistent"
+        mock_local_ckpt_manager = Mock()
+        mock_local_ckpt_manager.local_ckpt_dir = local_ckpt_dir
+        mock_local_ckpt_manager.load.return_value = (Mock(common_state_dict=mock_state_dict), "/ckpts/local_ckpt_id")
+        checkpointing_context = {"local_checkpoint_manager": mock_local_ckpt_manager}
+
+        load_checkpoint_fixtures["mock_cfg"].checkpoint.load = "/ckpts"
+        # For LOCAL checkpoints, run_config is built from cfg directly (not read_run_config).
+        # Set save_rng=False so the test doesn't attempt to restore RNG state from the
+        # minimal mock state_dict (which has no rng_state key and would hit sys.exit()).
+        load_checkpoint_fixtures["mock_cfg"].checkpoint.save_rng = False
+        # Ensure _is_megatron_mimo is False so the optimizer load path is not skipped.
+        # Mock() auto-creates attributes, making hasattr(..., "megatron_mimo_parallelism_config") True.
+        del load_checkpoint_fixtures["mock_cfg"].model.megatron_mimo_parallelism_config
+
+        with patch(
+            "megatron.bridge.training.checkpointing.get_data_distribution_group",
+            return_value=mock_data_distribution_group,
+        ) as mock_get_data_distribution_group:
+            load_checkpoint(
+                load_checkpoint_fixtures["mock_state"],
+                load_checkpoint_fixtures["mock_model"],
+                mock_layer_wise_optim,
+                load_checkpoint_fixtures["mock_scheduler"],
+                checkpointing_context=checkpointing_context,
+                pg_collection=mock_pg_collection,
+            )
+
+        mock_get_data_distribution_group.assert_called_once_with(
+            mock_pg_collection, load_checkpoint_fixtures["mock_cfg"].model
+        )
+        expected_path = f"{local_ckpt_dir}/layer_wise_optimizer_5.pt"
+        mock_layer_wise_optim.load_state_dict_from_file.assert_called_once_with(expected_path)
+
+    @patch("megatron.bridge.training.checkpointing.is_hf_checkpoint_dir", return_value=False)
+    @patch("megatron.bridge.training.checkpointing._load_base_checkpoint")
+    @patch("megatron.bridge.training.checkpointing.read_train_state")
+    @patch("megatron.bridge.training.checkpointing.read_run_config")
+    @patch("megatron.bridge.training.checkpointing.unwrap_model")
+    @patch("megatron.bridge.training.checkpointing.checkpoint_exists")
+    @patch("megatron.bridge.training.checkpointing.set_checkpoint_version")
+    @patch("megatron.bridge.training.checkpointing.update_num_microbatches")
+    @patch("megatron.bridge.training.checkpointing.print_rank_0")
+    @patch("megatron.bridge.training.checkpointing.get_pg_collection")
+    @patch("megatron.bridge.training.checkpointing.get_rerun_state_machine")
+    @patch("megatron.bridge.training.checkpointing.generate_state_dict")
+    @patch("megatron.bridge.training.checkpointing.get_rng_state")
+    @patch("megatron.bridge.training.checkpointing.dist_checkpointing")
+    @patch("megatron.bridge.training.checkpointing._build_sharded_state_dict_metadata")
+    @patch("os.path.exists")
+    @patch("torch.distributed.is_initialized")
+    def test_load_global_checkpoint_uses_standard_load_state_dict(
+        self,
+        mock_dist_init,
+        mock_exists_os,
+        mock_build_metadata,
+        mock_dist_ckpt,
+        mock_get_rng_state,
+        mock_generate_state_dict,
+        mock_rerun_machine,
+        mock_get_pg_collection,
+        mock_print_rank_0,
+        mock_update_microbatches,
+        mock_set_version,
+        mock_exists,
+        mock_unwrap,
+        mock_read_config,
+        mock_read_state,
+        mock_load_base,
+        mock_is_hf_checkpoint_dir,
+        load_checkpoint_fixtures,
+    ):
+        """For GLOBAL checkpoints, optimizer state is loaded via standard load_state_dict.
+
+        Even with a LayerWiseDistributedOptimizer, global (torch_dist) checkpoints embed
+        optimizer state in the distributed checkpoint.  load_state_dict_from_file must NOT
+        be called; the regular load_state_dict path is used instead.
+        """
+        from megatron.core.optimizer.layer_wise_optimizer import LayerWiseDistributedOptimizer
+
+        mock_layer_wise_optim = Mock(spec=LayerWiseDistributedOptimizer)
+        mock_layer_wise_optim.__class__ = LayerWiseDistributedOptimizer
+        mock_layer_wise_optim.is_stub_optimizer = False
+
+        mock_dist_init.return_value = False
+        mock_exists.return_value = True
+        mock_exists_os.return_value = True
+        mock_unwrap.return_value = load_checkpoint_fixtures["mock_model"]
+        mock_generate_state_dict.return_value = {"test": "state"}
+        mock_get_rng_state.return_value = Mock()
+        mock_build_metadata.return_value = {}
+        mock_dist_ckpt.load_content_metadata.return_value = {}
+        mock_dist_ckpt.load.return_value = {}
+        mock_rerun_machine.return_value.state_dict.return_value = {}
+
+        mock_pg_collection = Mock()
+
+        mock_pg_collection.gtp_remat = None
+
+        mock_pg_collection.expt_gtp_remat = None
+        mock_pg_collection.tp.rank.return_value = 0
+        mock_pg_collection.tp.size.return_value = 1
+        mock_pg_collection.pp.rank.return_value = 0
+        mock_pg_collection.pp.size.return_value = 1
+        mock_pg_collection.dp.rank.return_value = 0
+        mock_pg_collection.dp_cp_gtp_remat.rank.return_value = 0
+        mock_get_pg_collection.return_value = mock_pg_collection
+
+        mock_train_state = Mock()
+        mock_train_state.step = 1000
+        mock_train_state.floating_point_operations_so_far = 0
+        mock_read_state.return_value = mock_train_state
+
+        mock_read_config.return_value = {
+            "model": {"tensor_model_parallel_size": 1, "pipeline_model_parallel_size": 1},
+            "checkpoint": {"save_rng": False, "save_optim": True, "fully_parallel_save": False},
+        }
+
+        mock_state_dict = {
+            "checkpoint_version": 3.0,
+            "model": {"param": "value"},
+            "optimizer": {"param_groups": []},
+            "opt_param_scheduler": {"max_lr": 0.001},
+        }
+        # GLOBAL checkpoint - optimizer is in state_dict["optimizer"]
+        mock_load_base.return_value = (mock_state_dict, "/ckpts/iter_0001000", False, CheckpointType.GLOBAL)
+
+        load_checkpoint_fixtures["mock_cfg"].checkpoint.load = "/ckpts"
+        # Ensure _is_megatron_mimo is False so the optimizer load path is not skipped.
+        del load_checkpoint_fixtures["mock_cfg"].model.megatron_mimo_parallelism_config
+
+        load_checkpoint(
+            load_checkpoint_fixtures["mock_state"],
+            load_checkpoint_fixtures["mock_model"],
+            mock_layer_wise_optim,
+            load_checkpoint_fixtures["mock_scheduler"],
+            pg_collection=mock_pg_collection,
+        )
+
+        # Standard load_state_dict must be called; per-rank file loader must NOT be called.
+        mock_layer_wise_optim.load_state_dict.assert_called_once_with(mock_state_dict["optimizer"])
+        mock_layer_wise_optim.load_state_dict_from_file.assert_not_called()
+
+
+class TestMaybeLoadDataloaderState:
+    """Tests for restoring Energon dataloader stream-position state on resume."""
+
+    @pytest.fixture(autouse=True)
+    def _dist_initialized(self):
+        """megatron.core.utils.get_pg_rank returns 0 for every group unless torch.distributed is
+        initialized. Stub is_initialized=True so the real get_pg_rank resolves each mock group's rank
+        (while still mapping a None group to 0), and stub get_rank=0 so print_rank_0 -> safe_get_rank
+        does not hit the uninitialized default process group."""
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+        ):
+            yield
+
+    @staticmethod
+    def _pg(cp: int | None = 0, pp: int = 0, tp: int = 0, dp: int = 0, dp_size: int = 1):
+        """Mock a ProcessGroupCollection with the given per-dimension ranks. Only cp may be None —
+        modeling a collection configured without context parallelism (tp/pp/dp are always
+        populated); the real get_pg_rank then reads the absent cp group as rank 0."""
+        pg = Mock()
+        pg.gtp_remat = None
+        if cp is None:
+            pg.cp = None
+        else:
+            pg.cp.rank.return_value = cp
+        pg.pp.rank.return_value = pp
+        pg.tp.rank.return_value = tp
+        pg.dp.rank.return_value = dp
+        pg.dp.size.return_value = dp_size
+        return pg
+
+    def test_noop_when_no_path(self):
+        """No load path => nothing restored."""
+        train_iterator = Mock()
+        maybe_load_dataloader_state(train_iterator, 10, None, pg_collection=self._pg())
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    def test_noop_when_iterator_is_none(self):
+        """No iterator => no-op (must not raise)."""
+        maybe_load_dataloader_state(None, 10, "/some/path", pg_collection=self._pg())
+
+    def test_noop_when_train_iterator_is_list(self, tmp_path):
+        """VPP yields a list of iterators; the single-iterator case is the only one handled."""
+        maybe_load_dataloader_state([Mock()], 10, str(tmp_path), pg_collection=self._pg())
+
+    def test_noop_when_iterable_lacks_restore_state(self, tmp_path):
+        """Non-Energon iterables (no restore_state) are skipped without error."""
+        train_iterator = Mock(spec=["iterable"])
+        train_iterator.iterable = Mock(spec=[])  # hasattr(..., "restore_state") is False
+        maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+    def test_missing_dir_warns_and_skips(self, tmp_path):
+        """A missing state directory is tolerated so pre-feature checkpoints still resume."""
+        train_iterator = Mock()
+        missing = tmp_path / "energon"  # never created
+        maybe_load_dataloader_state(train_iterator, 10, str(missing), pg_collection=self._pg())
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    def test_missing_selected_iteration_warns_and_skips(self, tmp_path):
+        """An unrelated state generation does not prevent an older checkpoint from resuming."""
+        train_iterator = Mock()
+        os.makedirs(get_checkpoint_name(str(tmp_path), 20))
+
+        maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    def test_existing_dir_missing_file_raises(self, tmp_path):
+        """If the state dir exists but this rank's file does not, fail loudly (likely a DP-size change)."""
+        train_iterator = Mock()
+        os.makedirs(get_checkpoint_name(str(tmp_path), 10))
+        # The selected iteration exists but contains no state file for this data-parallel rank.
+        with pytest.raises(RuntimeError, match="data-parallel size"):
+            maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+    @patch("megatron.bridge.training.checkpointing.energon_torch_load")
+    def test_extra_saved_dp_rank_file_raises(self, mock_load, tmp_path):
+        """A smaller current DP size must not silently discard saved rank state."""
+        train_iterator = Mock()
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "train_dataloader_dprank000.pt").touch()
+        (iter_dir / "train_dataloader_dprank001.pt").touch()
+        pg_collection = self._pg(dp=0, dp_size=1)
+
+        with pytest.raises(RuntimeError, match="data-parallel size"):
+            maybe_load_dataloader_state(
+                train_iterator,
+                10,
+                str(tmp_path),
+                pg_collection=pg_collection,
+            )
+
+        mock_load.assert_not_called()
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.energon_torch_load")
+    def test_restores_on_every_cp_tp_pp_rank(self, mock_load, tmp_path):
+        """Unlike save, restore must run on every cp/tp/pp because
+        each rank pulls from its own data iterator. Keyed by the pure DP rank."""
+        train_iterator = Mock()
+        iter_dir = get_checkpoint_name(str(tmp_path), 10)
+        os.makedirs(iter_dir, exist_ok=True)
+        Path(iter_dir, "train_dataloader_dprank000.pt").touch()
+        mock_load.return_value = {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}
+
+        # cp=1, pp=1, tp=1 would have been skipped by save-style (cp0,pp0,tp0) gating; restore must not skip.
+        maybe_load_dataloader_state(
+            train_iterator,
+            10,
+            str(tmp_path),
+            pg_collection=self._pg(cp=1, pp=1, tp=1, dp=0),
+        )
+
+        train_iterator.iterable.restore_state.assert_called_once_with({"dummy_energon_state": "xyz"})
+
+    @patch("megatron.bridge.training.checkpointing.energon_torch_load")
+    def test_restores_from_file(self, mock_load, tmp_path):
+        """Happy path: the per-DP-rank file is loaded and restore_state is called with the saved dict."""
+        train_iterator = Mock()
+        iter_dir = get_checkpoint_name(str(tmp_path), 10)
+        os.makedirs(iter_dir, exist_ok=True)
+        # dp_rank defaults to 0 => dprank000.
+        Path(iter_dir, "train_dataloader_dprank000.pt").touch()
+        mock_load.return_value = {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}
+
+        maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+        train_iterator.iterable.restore_state.assert_called_once_with({"dummy_energon_state": "xyz"})
+
+    def test_restores_from_msc_file(self, tmp_path):
+        """An Energon state colocated with an MSC checkpoint restores through the remote adapter."""
+        MultiStorageClientFeature.enable()
+        msc = MultiStorageClientFeature.import_package()
+        state_root = f"msc://default{tmp_path}/energon"
+        iter_dir = get_checkpoint_name(state_root, 10)
+        msc.os.makedirs(iter_dir, exist_ok=True)
+        state_path = os.path.join(iter_dir, "train_dataloader_dprank000.pt")
+        msc.torch.save({"dataloader_state_dict": {"dummy_energon_state": "xyz"}}, state_path)
+        train_iterator = Mock()
+
+        maybe_load_dataloader_state(train_iterator, 10, state_root, pg_collection=self._pg())
+
+        train_iterator.iterable.restore_state.assert_called_once_with({"dummy_energon_state": "xyz"})
+
+    def test_restores_energon_state_via_restricted_unpickler(self, tmp_path):
+        """Energon dataclass and NumPy state round-trips correctly through the restricted zip loader."""
+        from megatron.energon.flavors.webdataset.sample_loader import SliceState
+        from megatron.energon.rng import SystemRngState
+        from megatron.energon.savable_loader import (
+            SavableDataLoaderState,
+            SavableDatasetCheckpoint,
+            SavableDatasetState,
+        )
+        from megatron.energon.state import FlexState
+
+        train_iterator = Mock()
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        state_path = iter_dir / "train_dataloader_dprank000.pt"
+        rng_state = SystemRngState(
+            torch=torch.arange(3),
+            numpy=np.arange(3, dtype=np.uint32),
+            random=(3, (1, 2, 3), None),
+        )
+        loader_state = SavableDataLoaderState(
+            worker_states=[
+                SavableDatasetCheckpoint(
+                    state=SavableDatasetState(
+                        rng=rng_state,
+                        dataset_state=FlexState(active_slices=[SliceState(index=2, current=17)]),
+                        sample_index=5,
+                    ),
+                    offset=1,
+                )
+            ],
+            next_worker_id=0,
+            micro_batch_size=2,
+        )
+        torch.save({"dataloader_state_dict": loader_state}, state_path)
+
+        maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+        restored = train_iterator.iterable.restore_state.call_args.args[0]
+        assert isinstance(restored, SavableDataLoaderState)
+        assert restored.next_worker_id == loader_state.next_worker_id
+        assert restored.micro_batch_size == loader_state.micro_batch_size
+        restored_dataset_state = restored.worker_states[0].state
+        assert restored_dataset_state is not None
+        assert restored_dataset_state.sample_index == 5
+        np.testing.assert_array_equal(restored_dataset_state.rng.numpy, rng_state.numpy)
+        assert restored_dataset_state.dataset_state["active_slices"] == [SliceState(index=2, current=17)]
+
+    def test_rejects_reduce_payload_without_executing_it(self, tmp_path):
+        """A checkpoint cannot execute an arbitrary callable through pickle ``__reduce__``."""
+        train_iterator = Mock()
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        marker_path = tmp_path / "dataloader-state-payload-executed"
+        state_path = iter_dir / "train_dataloader_dprank000.pt"
+        torch.save({"dataloader_state_dict": _MaliciousDataloaderState(marker_path)}, state_path)
+
+        assert not marker_path.exists()
+        with pytest.raises(pickle.UnpicklingError, match="Restricted unpickler refused to load"):
+            maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+        assert not marker_path.exists()
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    def test_restores_multi_worker_state_with_savable_checkpoint(self, tmp_path):
+        """Multi-worker state and SavableCheckpoint nested inside FlexState round-trip correctly.
+
+        SavableCheckpoint (checkpoint_time + sample_index) is distinct from
+        SavableDatasetCheckpoint and can appear as a FlexState value when a
+        SavableDatasetWrapper is used inside a blending dataset.  Two worker
+        states are used to confirm the loader handles the list correctly.
+        """
+        from megatron.energon.flavors.webdataset.sample_loader import SliceState
+        from megatron.energon.rng import SystemRngState
+        from megatron.energon.savable_loader import (
+            SavableCheckpoint,
+            SavableDataLoaderState,
+            SavableDatasetCheckpoint,
+            SavableDatasetState,
+        )
+        from megatron.energon.state import FlexState
+
+        def _rng(seed: int) -> SystemRngState:
+            return SystemRngState(
+                torch=torch.arange(seed, seed + 3),
+                numpy=np.arange(seed, seed + 3, dtype=np.uint32),
+                random=(seed, tuple(range(seed, seed + 3)), None),
+            )
+
+        # Worker 0: simple blending state with two active slices.
+        worker0 = SavableDatasetCheckpoint(
+            state=SavableDatasetState(
+                rng=_rng(0),
+                dataset_state=FlexState(
+                    active_slices=[SliceState(index=0, current=11), SliceState(index=1, current=22)]
+                ),
+                sample_index=100,
+            ),
+            offset=0,
+        )
+        # Worker 1: FlexState contains a nested SavableCheckpoint, simulating a
+        # SavableDatasetWrapper used as an inner dataset.
+        nested_ckpt = SavableCheckpoint(
+            state=SavableDatasetState(
+                rng=_rng(10),
+                dataset_state=FlexState(active_slices=[SliceState(index=5, current=99)]),
+                sample_index=50,
+            ),
+            checkpoint_time=1.0,
+            sample_index=50,
+        )
+        worker1 = SavableDatasetCheckpoint(
+            state=SavableDatasetState(
+                rng=_rng(20),
+                dataset_state=FlexState(inner=nested_ckpt),
+                sample_index=200,
+            ),
+            offset=2,
+        )
+
+        loader_state = SavableDataLoaderState(
+            worker_states=[worker0, worker1],
+            next_worker_id=1,
+            micro_batch_size=8,
+        )
+
+        train_iterator = Mock()
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        state_path = iter_dir / "train_dataloader_dprank000.pt"
+        torch.save({"dataloader_state_dict": loader_state}, state_path)
+
+        maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=self._pg())
+
+        restored = train_iterator.iterable.restore_state.call_args.args[0]
+        assert isinstance(restored, SavableDataLoaderState)
+        assert restored.next_worker_id == 1
+        assert restored.micro_batch_size == 8
+        assert len(restored.worker_states) == 2
+
+        r0 = restored.worker_states[0].state
+        assert r0.sample_index == 100
+        assert r0.dataset_state["active_slices"] == [
+            SliceState(index=0, current=11),
+            SliceState(index=1, current=22),
+        ]
+        np.testing.assert_array_equal(r0.rng.numpy, _rng(0).numpy)
+
+        r1 = restored.worker_states[1].state
+        assert r1.sample_index == 200
+        assert isinstance(r1.dataset_state["inner"], SavableCheckpoint)
+        assert r1.dataset_state["inner"].sample_index == 50
+        assert r1.dataset_state["inner"].checkpoint_time == 1.0
+        np.testing.assert_array_equal(r1.rng.numpy, _rng(20).numpy)
+
+
+class TestMaybeSaveDataloaderState:
+    """Tests for gating which rank writes the Energon dataloader stream-position state."""
+
+    @pytest.fixture(autouse=True)
+    def _dist_initialized(self):
+        """megatron.core.utils.get_pg_rank returns 0 for every group unless torch.distributed is
+        initialized. Stub is_initialized=True so the real get_pg_rank resolves each mock group's rank
+        (while still mapping a None group to 0), and stub get_rank=0 so print_rank_0 -> safe_get_rank
+        does not hit the uninitialized default process group."""
+        with (
+            patch("torch.distributed.is_initialized", return_value=True),
+            patch("torch.distributed.get_rank", return_value=0),
+        ):
+            yield
+
+    @staticmethod
+    def _pg(cp: int | None = 0, pp: int = 0, tp: int = 0, dp: int = 0):
+        """Mock a ProcessGroupCollection with the given per-dimension ranks. Only cp may be None —
+        modeling a collection configured without context parallelism (tp/pp/dp are always
+        populated); the real get_pg_rank then reads the absent cp group as rank 0."""
+        pg = Mock()
+        pg.gtp_remat = None
+        if cp is None:
+            pg.cp = None
+        else:
+            pg.cp.rank.return_value = cp
+        pg.pp.rank.return_value = pp
+        pg.tp.rank.return_value = tp
+        pg.dp.rank.return_value = dp
+        return pg
+
+    @staticmethod
+    def _iterator():
+        """Mock train iterator whose iterable.save_state() returns a sentinel state dict."""
+        train_iterator = Mock()
+        train_iterator.iterable.save_state.return_value = {"dummy_energon_state": "xyz"}
+        return train_iterator
+
+    def test_gtp_peers_save_distinct_streams_and_restore_without_racing_cleanup(self, tmp_path):
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        (iter_dir / "train_dataloader_dprank002.pt").write_text("stale generation")
+        (iter_dir / "model.pt").write_text("model checkpoint")
+        groups = []
+        with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier") as barrier:
+            for rank in range(2):
+                pg = self._pg(dp=0)  # Both peers have the same replica-DP rank.
+                pg.gtp_remat = Mock()
+                pg.gtp_remat.size.return_value = 2
+                data_group = Mock()
+                data_group.rank.return_value = rank
+                data_group.size.return_value = 2
+                groups.append(data_group)
+                train_iterator = self._iterator()
+                train_iterator.iterable.save_state.return_value = {"stream": rank}
+                with patch(
+                    "megatron.bridge.training.gtp.parallel_state.get_data_parallel_group", return_value=data_group
+                ) as get_group:
+                    maybe_save_dataloader_state(Mock(), train_iterator, 10, str(tmp_path), pg_collection=pg)
+                get_group.assert_called_once_with(with_gtp_remat=True)
+        assert not (iter_dir / "train_dataloader_dprank002.pt").exists()
+        assert (iter_dir / "model.pt").read_text() == "model checkpoint"
+        assert sorted(path.name for path in iter_dir.glob("train_dataloader_dprank*.pt")) == [
+            "train_dataloader_dprank000.pt",
+            "train_dataloader_dprank001.pt",
+        ]
+        assert [call.kwargs["group"] for call in barrier.call_args_list] == [
+            groups[0],
+            groups[0],
+            groups[1],
+            groups[1],
+        ]
+        for rank, data_group in enumerate(groups):
+            pg = self._pg(dp=0, cp=1)  # CP peers restore the same stream file.
+            pg.gtp_remat = Mock()
+            pg.gtp_remat.size.return_value = 2
+            train_iterator = self._iterator()
+            with patch("megatron.bridge.training.gtp.parallel_state.get_data_parallel_group", return_value=data_group):
+                maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=pg)
+            train_iterator.iterable.restore_state.assert_called_once_with({"stream": rank})
+
+    def test_gtp_rejects_legacy_duplicate_dataloader_state(self, tmp_path):
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        torch.save({"dataloader_state_dict": {"stream": 0}}, iter_dir / "train_dataloader_dprank000.pt")
+        pg = self._pg(dp=0)
+        pg.gtp_remat = Mock()
+        pg.gtp_remat.size.return_value = 2
+        data_group = Mock()
+        data_group.rank.return_value = 0
+        data_group.size.return_value = 2
+        train_iterator = self._iterator()
+        with patch("megatron.bridge.training.gtp.parallel_state.get_data_parallel_group", return_value=data_group):
+            with pytest.raises(RuntimeError, match="saved for data-parallel size 1.*current data-parallel size is 2"):
+                maybe_load_dataloader_state(train_iterator, 10, str(tmp_path), pg_collection=pg)
+        train_iterator.iterable.restore_state.assert_not_called()
+
+    def test_noop_when_no_path(self):
+        """No save path => nothing is saved."""
+        train_iterator = self._iterator()
+        maybe_save_dataloader_state(Mock(), train_iterator, 10, None, pg_collection=self._pg())
+        train_iterator.iterable.save_state.assert_not_called()
+
+    @pytest.mark.parametrize("ranks", [{"cp": 1}, {"tp": 1}, {"pp": 1}], ids=["cp", "tp", "pp"])
+    def test_skips_nonzero_cp_tp_pp_rank(self, ranks):
+        """Tensor/pipeline/context-parallel ranks all replicate the per-DP-rank state, so only the
+        tp0/pp0/cp0 leader writes preventing racing on the same train_dataloader_dprank{dp}.pt file."""
+        train_iterator = self._iterator()
+        maybe_save_dataloader_state(Mock(), train_iterator, 10, "/some/path", pg_collection=self._pg(**ranks))
+        train_iterator.iterable.save_state.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.torch.save")
+    def test_writes_on_zero_cp_tp_pp_rank(self, mock_save, tmp_path):
+        """The single tp0/pp0/cp0 writer saves the state under the per-DP-rank filename."""
+        train_iterator = self._iterator()
+        # patch barrier: no real process group exists in a unit test.
+        with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"):
+            maybe_save_dataloader_state(Mock(), train_iterator, 10, str(tmp_path), pg_collection=self._pg(dp=2))
+
+        train_iterator.iterable.save_state.assert_called_once_with()
+        saved_dict, saved_path = mock_save.call_args[0]
+        assert saved_dict == {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}
+        assert saved_path.endswith("train_dataloader_dprank002.pt")
+
+    @patch("megatron.bridge.training.checkpointing.torch.save")
+    def test_writes_when_cp_group_is_none(self, mock_save, tmp_path):
+        """A run without context parallelism leaves cp=None. get_pg_rank reads a
+        None group as rank 0, so the (pp0, tp0, cp0) leader still writes instead of raising on
+        None.rank()."""
+        train_iterator = self._iterator()
+        with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"):
+            maybe_save_dataloader_state(
+                Mock(), train_iterator, 10, str(tmp_path), pg_collection=self._pg(cp=None, dp=2)
+            )
+
+        train_iterator.iterable.save_state.assert_called_once_with()
+        _, saved_path = mock_save.call_args[0]
+        assert saved_path.endswith("train_dataloader_dprank002.pt")
+
+    def test_writes_to_msc_path(self, tmp_path):
+        """An Energon state colocated with an MSC checkpoint is written through the remote adapter."""
+        MultiStorageClientFeature.enable()
+        msc = MultiStorageClientFeature.import_package()
+        state_root = f"msc://default{tmp_path}/energon"
+        train_iterator = self._iterator()
+
+        with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"):
+            maybe_save_dataloader_state(Mock(), train_iterator, 10, state_root, pg_collection=self._pg())
+
+        state_path = os.path.join(
+            get_checkpoint_name(state_root, 10),
+            "train_dataloader_dprank000.pt",
+        )
+        assert msc.os.path.isfile(state_path)
+        assert msc.torch.load(state_path, weights_only=True) == {
+            "dataloader_state_dict": {"dummy_energon_state": "xyz"}
+        }
+
+    def test_reused_iteration_rejects_stale_dp_rank_state(self, tmp_path):
+        """Reusing an iteration at smaller DP must not retain rank files from its previous owner."""
+        iter_dir = Path(get_checkpoint_name(str(tmp_path), 10))
+        iter_dir.mkdir(parents=True)
+        torch.save(
+            {"dataloader_state_dict": {"generation": "old"}},
+            iter_dir / "train_dataloader_dprank001.pt",
+        )
+
+        with patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"):
+            maybe_save_dataloader_state(
+                Mock(),
+                self._iterator(),
+                10,
+                str(tmp_path),
+                pg_collection=self._pg(dp=0),
+            )
+
+        with pytest.raises(RuntimeError, match="data-parallel size"):
+            maybe_load_dataloader_state(
+                Mock(),
+                10,
+                str(tmp_path),
+                pg_collection=self._pg(dp=1),
+            )
+
+    @patch("megatron.bridge.training.checkpointing.torch.save")
+    @patch("megatron.bridge.training.checkpointing.ensure_directory_exists")
+    @patch("megatron.bridge.training.checkpointing.get_checkpoint_name")
+    def test_writes_nondefault_msc_uri_through_remote_adapter(
+        self, mock_get_checkpoint_name, mock_ensure_directory, mock_torch_save
+    ):
+        """A named MSC profile must not be passed to PyTorch's local-path serializer."""
+        mock_get_checkpoint_name.return_value = "msc://named/checkpoints/energon/iter_0000010"
+        msc = Mock()
+        msc.glob.return_value = []
+        train_iterator = self._iterator()
+
+        with (
+            patch.object(MultiStorageClientFeature, "is_enabled", return_value=True),
+            patch.object(MultiStorageClientFeature, "import_package", return_value=msc),
+            patch("megatron.bridge.training.checkpointing.torch.distributed.barrier"),
+        ):
+            maybe_save_dataloader_state(
+                Mock(),
+                train_iterator,
+                10,
+                "msc://named/checkpoints/energon",
+                pg_collection=self._pg(),
+            )
+
+        expected_path = "msc://named/checkpoints/energon/iter_0000010/train_dataloader_dprank000.pt"
+        mock_ensure_directory.assert_called_once_with(expected_path)
+        msc.torch.save.assert_called_once_with(
+            {"dataloader_state_dict": {"dummy_energon_state": "xyz"}}, expected_path
+        )
+        mock_torch_save.assert_not_called()
+
+
+class TestAlignRngStateShardedMetadata:
+    @staticmethod
+    def _rng(global_offset=(1, 3), global_shape=(2, 4), replica_id=5):
+        from megatron.core.dist_checkpointing.mapping import ShardedObject
+
+        return ShardedObject(
+            "rng_state",
+            None,
+            global_shape,
+            global_offset,
+            replica_id=replica_id,
+        )
+
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_keeps_generated_layout_without_torch_dist_metadata(self, mock_strategy, tmp_path):
+        rng_state = self._rng()
+
+        result = _align_rng_state_sharded_metadata(rng_state, str(tmp_path))
+
+        assert result is rng_state
+        mock_strategy.assert_not_called()
+
+    @patch("megatron.bridge.training.checkpointing.Path.is_file", return_value=True)
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_keeps_exact_stored_layout(self, mock_strategy, mock_is_file):
+        rng_state = self._rng()
+        mock_strategy.return_value.load_sharded_metadata.return_value = {rng_state.unique_key: rng_state}
+
+        result = _align_rng_state_sharded_metadata(rng_state, "/checkpoint")
+
+        assert result is rng_state
+        mock_is_file.assert_called_once_with()
+        mock_strategy.return_value.load_sharded_metadata.assert_called_once_with(Path("/checkpoint"))
+
+    @patch("megatron.bridge.training.checkpointing.Path.is_file", return_value=True)
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_adopts_unique_dp_cp_sharded_layout(self, mock_strategy, _mock_is_file):
+        rng_state = self._rng()
+        stored = self._rng(global_offset=(1, 3, 5), global_shape=(2, 4, 8), replica_id=0)
+        mock_strategy.return_value.load_sharded_metadata.return_value = {stored.unique_key: stored}
+
+        result = _align_rng_state_sharded_metadata(rng_state, "/checkpoint")
+
+        assert result.global_shape == (2, 4, 8)
+        assert result.global_offset == (1, 3, 5)
+        assert result.replica_id == 0
+
+    @patch("megatron.bridge.training.checkpointing.Path.is_file", return_value=True)
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_returns_none_without_a_dp_cp_shard_for_this_rank(self, mock_strategy, _mock_is_file):
+        rng_state = self._rng(replica_id=5)
+        stored = [self._rng(global_offset=(1, 3, rank), global_shape=(2, 4, 4), replica_id=0) for rank in range(4)]
+        mock_strategy.return_value.load_sharded_metadata.return_value = {item.unique_key: item for item in stored}
+
+        result = _align_rng_state_sharded_metadata(rng_state, "/checkpoint")
+
+        assert result is None
+
+    @pytest.mark.parametrize("stored", [{}, None])
+    @patch("megatron.bridge.training.checkpointing.Path.is_file", return_value=True)
+    @patch("megatron.bridge.training.checkpointing.TorchDistLoadShardedStrategy")
+    def test_keeps_generated_layout_without_unique_match(self, mock_strategy, _mock_is_file, stored):
+        rng_state = self._rng()
+        if stored is None:
+            first = self._rng(global_offset=(1, 3, 0), global_shape=(2, 4, 8), replica_id=0)
+            second = self._rng(global_offset=(1, 3, 5), global_shape=(2, 4, 9), replica_id=1)
+            stored = {"first": first, "second": second}
+        mock_strategy.return_value.load_sharded_metadata.return_value = stored
+
+        result = _align_rng_state_sharded_metadata(rng_state, "/checkpoint")
+
+        assert result is rng_state
+
+
+class TestAsyncCheckpointScheduling:
+    """Test async request handoff to the NVRx worker."""
+
+    def test_schedule_async_save_forwards_nvrx_request(self):
+        """The NVRx queue must receive the original async request unchanged."""
+        async_queue = Mock()
+        state = Mock()
+        state.async_calls_queue = async_queue
+        state.cfg.checkpoint = CheckpointConfig()
+        state.cfg.checkpoint.async_save = True
+        nvrx_request = NVRxAsyncRequest(
+            async_fn=Mock(),
+            async_fn_args=(0, None, None),
+            finalize_fns=[Mock()],
+            preload_fn=Mock(),
+        )
+
+        schedule_async_save(state, nvrx_request)
+
+        scheduled_request = async_queue.schedule_async_request.call_args.args[0]
+        assert scheduled_request is nvrx_request
+
+
+class TestCheckpointDpCpGroup:
+    """`_checkpoint_dp_cp_group` picks the group sharded-checkpoint replica_id is derived from."""
+
+    def test_prefers_gtp_remat_inclusive_group(self):
+        """With GTP active, replica_id must come from the gtp_remat-INCLUSIVE group."""
+        from megatron.bridge.training.checkpointing import _checkpoint_dp_cp_group
+
+        pg_collection = Mock()
+        pg_collection.dp_cp = Mock(name="dp_cp_replicate")
+        pg_collection.dp_cp_gtp_remat = Mock(name="dp_cp_gtp_remat")
+
+        assert _checkpoint_dp_cp_group(pg_collection) is pg_collection.dp_cp_gtp_remat
+
+    @pytest.mark.parametrize("absent_value", [None, "missing"])
+    def test_falls_back_to_dp_cp(self, absent_value):
+        """Older Megatron-Core has no `dp_cp_gtp_remat`; the fallback must be a no-op."""
+        from megatron.bridge.training.checkpointing import _checkpoint_dp_cp_group
+
+        pg_collection = Mock(spec=["dp_cp"]) if absent_value == "missing" else Mock()
+        pg_collection.dp_cp = Mock(name="dp_cp_replicate")
+        if absent_value is None:
+            pg_collection.dp_cp_gtp_remat = None
+
+        assert _checkpoint_dp_cp_group(pg_collection) is pg_collection.dp_cp
+
+
+@pytest.mark.parametrize("versions", [(3.0, 3.1), (3.1, 3.0)])
+def test_checkpoint_minor_version_changes_are_compatible(monkeypatch, versions):
+    """Teacher/student checkpoints may differ in optimizer format, not QKV layout."""
+    from megatron.bridge.training import checkpointing
+
+    monkeypatch.setattr(checkpointing, "_CHECKPOINT_VERSION", None)
+    for version in versions:
+        checkpointing.set_checkpoint_version(version)
+    assert checkpointing.get_checkpoint_version() == versions[-1]
+    with pytest.raises(AssertionError, match="checkpoint versions do not match"):
+        checkpointing.set_checkpoint_version(2.0)

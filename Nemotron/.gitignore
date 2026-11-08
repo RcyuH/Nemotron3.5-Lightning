@@ -1,0 +1,131 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+.venv/
+
+# UV lock files in recipe stages are tracked for reproducible builds
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Testing
+.pytest_cache/
+.coverage
+htmlcov/
+.tox/
+.hypothesis/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# mypy
+.mypy_cache/
+.dmypy.json
+dmypy.json
+
+# Ruff
+.ruff_cache/
+
+# Environment
+.env
+.env.local
+env.toml
+conductor.json
+
+# Project specific
+/artifacts/
+.logs/
+output/
+outputs/
+logs/
+checkpoints/
+data/
+!src/nemotron/cli/commands/lightning35/data/
+!src/nemotron/cli/commands/lightning35/data/**
+!src/nemotron/cli/commands/nano3/data/
+!src/nemotron/cli/commands/super3/data/
+!src/nemotron/cli/commands/embed/data/
+!src/nemotron/cli/commands/omni3/data/
+!src/nemotron/cli/commands/omni3/data/**
+!src/nemotron/steps/**/data/
+!src/nemotron/steps/**/data/**
+!src/nemotron/cli/commands/data/
+!src/nemotron/cli/commands/data/**
+!src/nemotron/recipes/data/
+!src/nemotron/recipes/data/**
+# Documentation pages for data recipes (curation/, sdg/) live under
+# docs/nemotron/data/. Without this exception the broad ``data/`` rule
+# above swallows them — losing e.g. docs/nemotron/data/sdg/long-document.md.
+!docs/nemotron/data/
+!docs/nemotron/data/**
+# Re-ignore __pycache__ under the un-ignored data trees (the broad !data/**
+# rules above would otherwise let them through).
+src/nemotron/cli/commands/omni3/data/**/__pycache__/
+src/nemotron/cli/commands/lightning35/data/**/__pycache__/
+src/nemotron/cli/commands/data/**/__pycache__/
+src/nemotron/recipes/data/**/__pycache__/
+workspace/
+wandb/
+.nemotron/
+.conductor/
+
+# Claude Code
+CLAUDE.md
+.claude/
+
+# Compiled config
+config.yaml
+main.py
+src/nemotron/steps/_bootstrap/runtime/
+
+# Documentation build
+docs/_build/
+
+# Skill eval run outputs (generated; eval definitions like evals.json stay tracked)
+skills/*/evals/results/
+skills/*/evals/tier3-reports/
+
+# Local retrieval research and visualization artifacts
+/BENCHMARK.md
+/Retrieval-Synthetic-NVDocs-v1/
+/libs/nemo-retriever-research/
+/tmp/
+/tools/sdg-explorer.html
+/tools/serve-training-explorer.py
+/tools/training-explorer.html
+/docs/nemotron/embed/content-derived-source-fingerprints-prd.md
+/spec/
+/tests/skills/
+/tools/fetch_sample_corpus.py

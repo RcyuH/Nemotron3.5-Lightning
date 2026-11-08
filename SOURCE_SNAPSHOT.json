@@ -1,0 +1,17 @@
+{
+  "snapshot_date": "2026-11-08",
+  "repositories": {
+    "Megatron-Bridge": {
+      "upstream": "https://github.com/NVIDIA-NeMo/Megatron-Bridge.git",
+      "base_commit": "ec4ec358c3622134905144ca193516b194feddd5",
+      "working_tree_changes_included": true
+    },
+    "Nemotron": {
+      "upstream": "https://github.com/NVIDIA-NeMo/Nemotron.git",
+      "base_commit": "68c3751f8cf2eccbb5e9c20a63c27869c3473fed",
+      "working_tree_changes_included": true
+    }
+  },
+  "files": 4616,
+  "bytes": 139047708
+}

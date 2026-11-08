@@ -1,0 +1,109 @@
+# Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from functools import partial
+from typing import Callable
+
+import modelopt.torch.distill as mtd
+import modelopt.torch.distill.plugins.megatron as mtd_mcore
+import torch
+from megatron.core import parallel_state
+from megatron.core.transformer import MegatronModule
+from megatron.core.utils import unwrap_model
+
+from megatron.bridge.training.losses import create_masked_next_token_loss_function
+
+
+class ModelOptDistillConfig(mtd_mcore.DistillationConfig):
+    """Configuration settings for Model Optimizer distillation."""
+
+    pass
+
+
+def create_kd_loss_function(
+    loss_mask: torch.Tensor, model: MegatronModule, check_for_nan_in_loss: bool, check_for_spiky_loss: bool
+) -> Callable:
+    """Masked next-token loss, wrapped with the KD loss when the model is distilling.
+
+    Forward steps share this so a model family only has to supply its own batch handling to
+    become distillable; a step that builds its loss directly would silently train without KD.
+    """
+    original_loss_fn = create_masked_next_token_loss_function(loss_mask, check_for_nan_in_loss, check_for_spiky_loss)
+    unwrapped_model = unwrap_model(model)
+    if not isinstance(unwrapped_model, mtd.DistillationModel):
+        return original_loss_fn
+    return partial(loss_func_kd, loss_mask=loss_mask, original_loss_fn=original_loss_fn, model=unwrapped_model)
+
+
+def loss_func_kd(
+    output_tensor: torch.Tensor, loss_mask: torch.Tensor, original_loss_fn: Callable, model: MegatronModule
+):
+    """Loss function (with KD Loss support).
+
+    Args:
+        output_tensor (Tensor): The tensor with the losses
+        loss_mask (Tensor): Used to mask out some portions of the loss
+        original_loss_fn (Callable): The original loss function
+        model (GPTModel): The model (can be wrapped)
+    """
+    assert isinstance(model, mtd.DistillationModel), "Model must be a ModelOpt DistillationModel"
+
+    # Standard lm loss
+    loss_lm, num_tokens, report = original_loss_fn(output_tensor)
+
+    # Handle knowledge distillation
+    losses_kd = model.compute_kd_loss(
+        student_loss=loss_lm,
+        loss_reduction_fn=lambda x: _mask_loss(x, loss_mask),
+    )
+
+    report["total loss"] = torch.cat([losses_kd["kd_loss"].clone().detach().view(1), num_tokens.view(1)])
+    report["logits distillation loss"] = torch.cat(
+        [losses_kd["logits_loss"].clone().detach().view(1), num_tokens.view(1)]
+    )
+    report["intermediate distillation loss"] = torch.cat(
+        [losses_kd["intermediate_loss"].clone().detach().view(1), num_tokens.view(1)]
+    )
+
+    # Validation loss remains unchanged
+    if model.training:
+        loss = losses_kd["kd_loss"]
+    else:
+        loss = loss_lm
+
+    return loss, num_tokens, report
+
+
+def _mask_loss(output_tensor: torch.Tensor, loss_mask: torch.Tensor):
+    if isinstance(output_tensor, tuple):
+        # Special distillation flags indicating whether to perform additional tensor-parallel adjustments.
+        output_tensor, tp_reduce, is_sequence_parallel = output_tensor
+    else:
+        tp_reduce, is_sequence_parallel = False, False
+    tp_group = parallel_state.get_tensor_model_parallel_group()
+
+    if is_sequence_parallel:
+        # Sequence-parallel tensor derived from intermediate activation - need to split loss mask.
+        idx = tp_group.rank()
+        loss_mask = torch.tensor_split(loss_mask, tp_group.size(), dim=1)[idx]
+
+    losses = output_tensor.view(-1).float()
+    loss_mask = loss_mask.reshape(-1).float()
+    loss = torch.sum(losses * loss_mask)
+
+    if tp_reduce or is_sequence_parallel:
+        # Losses on parallel tensors require extra all-reduce to sync across MP ranks.
+        torch.distributed.all_reduce(loss, group=tp_group)
+
+    return loss
