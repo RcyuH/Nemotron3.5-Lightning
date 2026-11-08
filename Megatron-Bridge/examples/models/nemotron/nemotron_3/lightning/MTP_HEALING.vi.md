@@ -61,6 +61,10 @@ Mỗi dòng là một JSON object, kết thúc bằng assistant response đã ge
 
 Giữ `reasoning_content`, top-level `tools`, assistant `tool_calls` nếu rollout có dùng. Dùng tokenizer/chat template chính thức của snapshot; không thay bằng ChatML generic. `chat_template_kwargs` phải khớp cách render prompt lúc lấy rollout. Đặc biệt, chỉ giữ reasoning lịch sử nếu rollout cũng giữ nó.
 
+Entry point đọc JSONL theo từng dòng bằng Python để tránh Arrow suy luận một schema cố định cho metadata `tools` có cấu trúc khác nhau. Dòng JSON hỏng, row không phải object, hoặc row lỗi khi adapter/chuẩn hóa sẽ bị bỏ và có log số lượng cùng tối đa năm ví dụ lỗi.
+
+MTP-Healing chỉ train text-only: các row có payload ảnh/audio/video ở field riêng hoặc content part đa phương thức sẽ được lọc trước khi chọn collator. Các field media rỗng như `images: []` vẫn được giữ; nếu lọc hết dữ liệu thì pipeline dừng với lỗi rõ ràng.
+
 Mặc định `--loss-mode last_turn` chỉ giám sát assistant turn cuối, bao gồm reasoning/content/tool calls được mask đúng bởi Bridge. Dùng `--loss-mode assistant` nếu muốn giám sát tất cả assistant turns trong trajectory. Với trajectory có tool, thường lưu từng prefix + assistant response làm một row cho `last_turn`, hoặc dùng `assistant` cho toàn trajectory. Không dùng full-sequence loss vì sẽ train cả prompt/user/tool response.
 
 ### `input/output`

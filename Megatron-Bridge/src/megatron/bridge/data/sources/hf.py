@@ -14,9 +14,12 @@
 
 """Declarative Hugging Face sources, named presets, and shared normalization."""
 
+import glob
+import json
+import logging
 import math
 import random
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
@@ -30,6 +33,8 @@ from megatron.bridge.data.sources.hf_adapters import (
     prepare_hf_dataset_for_adapter,
     validate_hf_dataset_adapter,
 )
+
+logger = logging.getLogger(__name__)
 
 
 def _has_unset_data_file(value: Any) -> bool:
@@ -63,11 +68,17 @@ class HFDatasetSourceConfig:
     load_kwargs: dict[str, Any] | None = None
     schema_adapter: str | None = None
     adapter_kwargs: dict[str, Any] | None = None
+    skip_invalid_jsonl_rows: bool = False
+    skip_multimodal_rows: bool = False
 
     def validate(self) -> None:
         """Validate declarative source and adapter settings."""
         validate_declarative_mapping(self.load_kwargs, field_name="load_kwargs")
         validate_declarative_mapping(self.adapter_kwargs, field_name="adapter_kwargs")
+        if not isinstance(self.skip_invalid_jsonl_rows, bool):
+            raise TypeError("skip_invalid_jsonl_rows must be a boolean.")
+        if not isinstance(self.skip_multimodal_rows, bool):
+            raise TypeError("skip_multimodal_rows must be a boolean.")
         if self.load_kwargs is not None and "data_files" in self.load_kwargs:
             if _has_unset_data_file(self.load_kwargs["data_files"]):
                 raise ValueError("load_kwargs.data_files must contain non-empty paths.")
@@ -100,6 +111,17 @@ class HFDatasetSourceConfig:
         else:
             if not isinstance(self.path_or_dataset, str) or not self.path_or_dataset.strip():
                 raise ValueError("path_or_dataset must be a non-empty string.")
+        if self.skip_invalid_jsonl_rows:
+            if self.dataset_name is not None or self.path_or_dataset != "json" or self.subset is not None:
+                raise ValueError("skip_invalid_jsonl_rows requires a custom JSON source with no subset.")
+            if "data_files" not in (self.load_kwargs or {}):
+                raise ValueError("skip_invalid_jsonl_rows requires load_kwargs.data_files.")
+            unsupported_kwargs = set(self.load_kwargs or {}) - {"data_files", "encoding"}
+            if unsupported_kwargs:
+                unsupported = ", ".join(sorted(unsupported_kwargs))
+                raise ValueError(f"skip_invalid_jsonl_rows does not support load_kwargs: {unsupported}.")
+            if "[" in (self.split or ""):
+                raise ValueError("skip_invalid_jsonl_rows does not support split slicing.")
         if isinstance(self.subset, str) and not self.subset.strip():
             raise ValueError("subset must be non-empty when set.")
         if isinstance(self.subset, list) and (
@@ -261,9 +283,82 @@ def resolve_hf_dataset_source(source: HFDatasetSourceConfig) -> HFDatasetSourceC
         load_kwargs=load_kwargs,
         schema_adapter=preset.schema_adapter,
         adapter_kwargs=adapter_kwargs,
+        skip_multimodal_rows=source.skip_multimodal_rows,
     )
     resolved.validate()
     return resolved
+
+
+def _resolve_jsonl_files(data_files: Any, split: str) -> list[Path]:
+    """Resolve local JSONL paths for the requested split."""
+    if isinstance(data_files, Mapping):
+        split_name = split.partition("[")[0]
+        if split_name not in data_files:
+            raise ValueError(f"No data_files entry is configured for split '{split_name}'.")
+        data_files = data_files[split_name]
+
+    if isinstance(data_files, (str, Path)):
+        configured_files = [data_files]
+    elif isinstance(data_files, (list, tuple)):
+        configured_files = list(data_files)
+    else:
+        raise TypeError("JSONL data_files must be a path or a list of paths.")
+
+    resolved_files: list[Path] = []
+    for configured_file in configured_files:
+        if not isinstance(configured_file, (str, Path)):
+            raise TypeError("JSONL data_files entries must be paths.")
+        matches = sorted(glob.glob(str(configured_file), recursive=True))
+        if not matches:
+            raise FileNotFoundError(f"No files matched JSONL data_files path: {configured_file}")
+        for match in matches:
+            path = Path(match)
+            if path.suffix.lower() not in {".jsonl", ".ndjson"}:
+                raise ValueError(f"skip_invalid_jsonl_rows only supports JSONL/NDJSON files: {path}")
+            resolved_files.append(path)
+    return resolved_files
+
+
+def _load_jsonl_rows(source: HFDatasetSourceConfig) -> list[dict[str, Any]]:
+    """Read JSONL records without Arrow schema inference, skipping bad rows."""
+    resolved = resolve_hf_dataset_source(source)
+    assert resolved.split is not None
+    kwargs = resolved.load_kwargs or {}
+    paths = _resolve_jsonl_files(kwargs["data_files"], resolved.split)
+    encoding = kwargs.get("encoding", "utf-8")
+    rows: list[dict[str, Any]] = []
+    skipped = 0
+    failures: list[str] = []
+
+    for path in paths:
+        with path.open(encoding=encoding) as stream:
+            for line_number, line in enumerate(stream, start=1):
+                if not line.strip():
+                    skipped += 1
+                    if len(failures) < 5:
+                        failures.append(f"{path}:{line_number}: blank line")
+                    continue
+                try:
+                    row = json.loads(line)
+                    if not isinstance(row, Mapping):
+                        raise TypeError("JSONL row must be an object")
+                except (json.JSONDecodeError, TypeError) as error:
+                    skipped += 1
+                    if len(failures) < 5:
+                        failures.append(f"{path}:{line_number}: {type(error).__name__}: {error}")
+                    continue
+                rows.append(dict(row))
+
+    if skipped:
+        logger.warning(
+            "Skipped %d invalid/blank JSONL rows while loading %s. First skipped rows: %s",
+            skipped,
+            ", ".join(str(path) for path in paths),
+            "; ".join(failures),
+        )
+    if not rows:
+        raise ValueError("JSONL source produced no valid object rows.")
+    return rows
 
 
 def load_hf_dataset_source(source: HFDatasetSourceConfig) -> Any:
@@ -271,6 +366,8 @@ def load_hf_dataset_source(source: HFDatasetSourceConfig) -> Any:
     resolved = resolve_hf_dataset_source(source)
     assert resolved.path_or_dataset is not None
     assert resolved.split is not None
+    if resolved.skip_invalid_jsonl_rows:
+        return _load_jsonl_rows(resolved)
     kwargs = dict(resolved.load_kwargs or {})
     if isinstance(resolved.subset, list):
         datasets = [
@@ -292,6 +389,10 @@ def prepare_hf_dataset_sources(sources: Sequence[HFDatasetSourceConfig]) -> None
     an already-stable cache. Single-process callers need no preparation because
     their normal load has no competing writer.
     """
+    # The Python JSONL reader does not create or populate a Hugging Face cache.
+    # Reading those files here would add a full extra pass before each rank
+    # reads them for training.
+    sources = [source for source in sources if not source.skip_invalid_jsonl_rows]
     if (
         not sources
         or not torch.distributed.is_available()
@@ -332,6 +433,7 @@ def load_and_adapt_hf_dataset(source: HFDatasetSourceConfig) -> list[dict[str, A
         dataset,
         adapter_name=resolved.schema_adapter,
         adapter_kwargs=resolved.adapter_kwargs,
+        skip_invalid_rows=resolved.skip_invalid_jsonl_rows,
     )
 
 

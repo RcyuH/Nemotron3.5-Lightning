@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import logging
 import string
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -40,6 +41,7 @@ class PromptCompletionSFTExample(TypedDict):
 
 
 CanonicalSFTExample = ChatSFTExample | PromptCompletionSFTExample
+logger = logging.getLogger(__name__)
 
 
 @dataclass(kw_only=True)
@@ -144,20 +146,28 @@ _CANONICAL_PROMPT_KEY = "prompt"
 _CANONICAL_COMPLETION_KEY = "completion"
 _PLURAL_MEDIA_KEYS = (
     "images",
+    "image_urls",
     "image_paths",
     "videos",
+    "video_urls",
     "video_paths",
+    "audios",
+    "audio_urls",
     "audio_paths",
 )
 _MEDIA_KEYS = (
     "image",
+    "image_url",
     "image_path",
     "video",
+    "video_url",
     "video_path",
     "audio",
+    "audio_url",
     "audio_path",
     *_PLURAL_MEDIA_KEYS,
 )
+_MEDIA_MARKERS = ("<image>", "<video>", "<audio>")
 
 
 def validate_sft_preprocessing_config(config: SFTPreprocessingConfig) -> None:
@@ -265,9 +275,35 @@ def normalize_sft_example(
 def normalize_sft_examples(
     examples: Sequence[Mapping[str, Any]],
     preprocessing: SFTPreprocessingConfig,
+    *,
+    skip_invalid_rows: bool = False,
 ) -> list[dict[str, Any]]:
-    """Normalize adapted rows for one explicit SFT preprocessing variant."""
-    normalized = [normalize_sft_example(example, preprocessing) for example in examples]
+    """Normalize adapted rows for one explicit SFT preprocessing variant.
+
+    Args:
+        examples: Adapted source rows.
+        preprocessing: The selected chat or prompt-completion preprocessing.
+        skip_invalid_rows: Skip rows that fail individual normalization and
+            report a bounded summary instead of failing the complete source.
+    """
+    normalized: list[dict[str, Any]] = []
+    skipped = 0
+    failures: list[str] = []
+    for row_number, example in enumerate(examples, start=1):
+        try:
+            normalized.append(normalize_sft_example(example, preprocessing))
+        except (AttributeError, IndexError, KeyError, TypeError, ValueError) as error:
+            if not skip_invalid_rows:
+                raise
+            skipped += 1
+            if len(failures) < 5:
+                failures.append(f"row {row_number}: {type(error).__name__}: {error}")
+    if skipped:
+        logger.warning(
+            "Skipped %d rows during SFT normalization. First failures: %s",
+            skipped,
+            "; ".join(failures),
+        )
     if not normalized:
         raise ValueError("SFT source produced no examples after preprocessing normalization.")
     return normalized
@@ -280,12 +316,21 @@ def is_text_only_prompt_completion_example(
     """Return whether a row is a text-only prompt-completion example."""
     for key in _MEDIA_KEYS:
         value = example.get(key)
-        if value is None or (key in _PLURAL_MEDIA_KEYS and isinstance(value, list) and not value):
+        if value is None or (isinstance(value, str) and not value.strip()):
             continue
+        if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes)):
+            if len(value) == 0:
+                continue
         return False
     try:
-        normalize_sft_example(example, preprocessing)
+        normalized = normalize_sft_example(example, preprocessing)
     except (TypeError, ValueError):
+        return False
+    if any(
+        marker in normalized[key]
+        for key in (preprocessing.prompt_column, preprocessing.completion_column)
+        for marker in _MEDIA_MARKERS
+    ):
         return False
     return True
 

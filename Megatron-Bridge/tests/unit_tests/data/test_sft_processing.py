@@ -211,6 +211,19 @@ def test_chat_preprocessing_accepts_nullable_union_columns():
     ]
 
 
+def test_chat_preprocessing_can_skip_rows_that_fail_normalization():
+    normalized = normalize_sft_examples(
+        [
+            {"messages": [{"role": "assistant", "content": "valid"}]},
+            {"messages": "not a conversation"},
+        ],
+        ChatSFTPreprocessingConfig(),
+        skip_invalid_rows=True,
+    )
+
+    assert normalized == [{"conversation": [{"role": "assistant", "content": "valid"}]}]
+
+
 def test_prompt_completion_rejects_structured_conversation():
     with pytest.raises(ValueError, match="structured conversations"):
         normalize_sft_example(

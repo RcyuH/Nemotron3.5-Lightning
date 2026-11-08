@@ -624,18 +624,30 @@ def is_text_only_chat_example(example: Mapping[str, Any]) -> bool:
     """Return whether a supported chat row contains no media content parts."""
     top_level_media_keys = (
         "image",
+        "image_url",
         "images",
+        "image_urls",
         "image_path",
         "image_paths",
         "video",
+        "video_url",
         "videos",
+        "video_urls",
         "video_path",
         "video_paths",
         "audio",
+        "audio_url",
+        "audios",
+        "audio_urls",
         "audio_path",
         "audio_paths",
     )
-    if any(example.get(key) is not None for key in top_level_media_keys):
+    for key in top_level_media_keys:
+        value = example.get(key)
+        if value is None or (isinstance(value, str) and not value.strip()):
+            continue
+        if isinstance(value, (Mapping, Sequence)) and not isinstance(value, (str, bytes)) and len(value) == 0:
+            continue
         return False
     try:
         conversation = normalize_chat_conversation(example)

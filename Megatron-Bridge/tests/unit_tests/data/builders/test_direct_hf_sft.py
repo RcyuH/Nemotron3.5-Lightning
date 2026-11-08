@@ -137,6 +137,20 @@ def test_builder_leaves_multimodal_conversations_to_processor_collators(media_ty
     assert select_direct_hf_sft_collate([row]) is None
 
 
+def test_builder_uses_text_collator_when_media_fields_are_empty():
+    row = {
+        "conversation": [{"role": "assistant", "content": "answer"}],
+        "images": [],
+        "videos": [],
+        "audio": "",
+    }
+
+    selected = select_direct_hf_sft_collate([row])
+
+    assert selected is not None
+    assert selected.func is builder_module.text_chat_collate_fn
+
+
 def test_builder_keeps_text_shaped_nemotron_omni_data_on_model_collator(monkeypatch):
     row = {"conversation": [{"role": "user", "content": "question"}]}
     processor_type = type("NemotronH_Nano_Omni_Reasoning_V3Processor", (_Tokenizer,), {})
@@ -598,6 +612,44 @@ def test_builder_treats_empty_optional_media_as_text_only(monkeypatch):
             [{"prompt": "Q", "completion": "A", "images": [object()]}],
             config.preprocessing,
         )
+
+
+def test_text_only_source_skips_rows_with_real_multimodal_content(monkeypatch):
+    plain_row = {
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        "images": [],
+    }
+    image_row = {
+        "messages": [
+            {"role": "user", "content": [{"type": "text", "text": "describe"}, {"type": "image"}]},
+            {"role": "assistant", "content": "a picture"},
+        ]
+    }
+    monkeypatch.setattr(builder_module, "load_and_adapt_hf_dataset", lambda source: [plain_row, image_row])
+    source = HFDatasetSourceConfig(path_or_dataset="org/chat", skip_multimodal_rows=True)
+
+    examples = builder_module.load_direct_hf_sft_examples(source, ChatSFTPreprocessingConfig())
+
+    assert len(examples) == 1
+    assert examples[0]["conversation"][0]["content"] == "question"
+
+
+def test_text_only_source_errors_when_all_rows_are_multimodal(monkeypatch):
+    row = {
+        "messages": [
+            {"role": "user", "content": "question"},
+            {"role": "assistant", "content": "answer"},
+        ],
+        "audio": "sample.wav",
+    }
+    monkeypatch.setattr(builder_module, "load_and_adapt_hf_dataset", lambda source: [row])
+    source = HFDatasetSourceConfig(path_or_dataset="org/chat", skip_multimodal_rows=True)
+
+    with pytest.raises(ValueError, match="No text-only SFT examples remain"):
+        builder_module.load_direct_hf_sft_examples(source, ChatSFTPreprocessingConfig())
 
 
 def test_direct_hf_sft_config_resolves_canonical_builder(monkeypatch):

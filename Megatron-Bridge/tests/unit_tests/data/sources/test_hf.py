@@ -169,6 +169,53 @@ def test_source_rejects_unset_data_files(data_files):
         source.validate()
 
 
+def test_python_jsonl_loader_skips_bad_rows_and_preserves_heterogeneous_tools(tmp_path, monkeypatch):
+    path = tmp_path / "training.jsonl"
+    rows = [
+        {"messages": [{"role": "assistant", "content": "first"}], "tools": None},
+        {
+            "messages": [{"role": "assistant", "content": "second"}],
+            "tools": [
+                {
+                    "type": "function",
+                    "function": {
+                        "name": "lookup",
+                        "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
+                    },
+                }
+            ],
+        },
+    ]
+    path.write_text(
+        json.dumps(rows[0]) + "\n" + "{malformed json}\n" + json.dumps(rows[1]) + "\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(source_module, "load_dataset", lambda *args, **kwargs: pytest.fail("Arrow loader called"))
+
+    adapted = load_and_adapt_hf_dataset(
+        HFDatasetSourceConfig(
+            path_or_dataset="json",
+            split="train",
+            load_kwargs={"data_files": str(path)},
+            skip_invalid_jsonl_rows=True,
+        )
+    )
+
+    assert len(adapted) == 2
+    assert adapted[0]["tools"] is None
+    assert adapted[1]["tools"] == rows[1]["tools"]
+
+
+def test_skip_invalid_jsonl_rows_drops_schema_adapter_failures():
+    adapted = source_module.adapt_hf_dataset(
+        [{"question": "2+2"}, {"question": "2+2", "answer": "4"}],
+        adapter_name="gsm8k",
+        skip_invalid_rows=True,
+    )
+
+    assert adapted == [{"prompt": "Question: 2+2 Answer:", "completion": "4", "original_answers": ["4"]}]
+
+
 def test_named_source_resolves_physical_source_and_declarative_overrides():
     source = HFDatasetSourceConfig(
         dataset_name="raven",

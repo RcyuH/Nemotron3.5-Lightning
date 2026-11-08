@@ -16,6 +16,7 @@
 
 import io
 import json
+import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
 from pathlib import Path
@@ -26,6 +27,7 @@ from megatron.bridge.utils.common_utils import resolve_path
 
 
 HFDatasetAdapter = Callable[[Mapping[str, Any], Mapping[str, Any]], dict[str, Any] | None]
+logger = logging.getLogger(__name__)
 
 # Adapters only translate source-specific columns into canonical SFT rows. They
 # deliberately do not render chat templates or tokenize; the selected shared
@@ -418,6 +420,7 @@ def adapt_hf_dataset(
     *,
     adapter_name: str | None,
     adapter_kwargs: Mapping[str, Any] | None = None,
+    skip_invalid_rows: bool = False,
 ) -> list[dict[str, Any]]:
     """Normalize an already-loaded dataset into canonical SFT examples.
 
@@ -426,6 +429,8 @@ def adapt_hf_dataset(
         adapter_name: Optional registered schema adapter. Native conversation
             rows require no adapter.
         adapter_kwargs: Declarative adapter-specific options.
+        skip_invalid_rows: Skip rows that fail schema adaptation and report a
+            bounded summary instead of failing the complete source.
 
     Returns:
         Canonical text or multimodal conversation examples.
@@ -436,7 +441,27 @@ def adapt_hf_dataset(
     else:
         adapter = _ADAPTERS[adapter_name]
     kwargs = adapter_kwargs or {}
-    examples = [adapted for row in dataset if (adapted := adapter(row, kwargs)) is not None]
+    examples: list[dict[str, Any]] = []
+    skipped = 0
+    failures: list[str] = []
+    for row_number, row in enumerate(dataset, start=1):
+        try:
+            adapted = adapter(row, kwargs)
+        except (AttributeError, IndexError, KeyError, OSError, TypeError, ValueError) as error:
+            if not skip_invalid_rows:
+                raise
+            skipped += 1
+            if len(failures) < 5:
+                failures.append(f"row {row_number}: {type(error).__name__}: {error}")
+            continue
+        if adapted is not None:
+            examples.append(adapted)
+    if skipped:
+        logger.warning(
+            "Skipped %d rows during Hugging Face schema adaptation. First failures: %s",
+            skipped,
+            "; ".join(failures),
+        )
     if not examples:
         raise ValueError("Hugging Face source produced no examples after schema adaptation.")
     return examples

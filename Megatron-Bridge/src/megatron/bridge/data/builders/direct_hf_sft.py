@@ -249,7 +249,33 @@ def load_direct_hf_sft_examples(
     preprocessing: SFTPreprocessingConfig,
 ) -> list[dict[str, Any]]:
     """Load and normalize one declarative Hugging Face source."""
-    return normalize_sft_examples(load_and_adapt_hf_dataset(source), preprocessing)
+    examples = normalize_sft_examples(
+        load_and_adapt_hf_dataset(source),
+        preprocessing,
+        skip_invalid_rows=source.skip_invalid_jsonl_rows,
+    )
+    if source.skip_multimodal_rows:
+        examples = _skip_multimodal_sft_examples(examples, preprocessing)
+    return examples
+
+
+def _skip_multimodal_sft_examples(
+    examples: list[dict[str, Any]],
+    preprocessing: SFTPreprocessingConfig,
+) -> list[dict[str, Any]]:
+    """Drop rows containing actual non-text content before choosing a collator."""
+    if isinstance(preprocessing, ChatSFTPreprocessingConfig):
+        is_text_only = is_text_only_chat_example
+    else:
+        is_text_only = partial(is_text_only_prompt_completion_example, preprocessing=preprocessing)
+
+    text_only_examples = [example for example in examples if is_text_only(example)]
+    skipped = len(examples) - len(text_only_examples)
+    if skipped:
+        logger.warning("Skipped %d multimodal SFT rows; this run is configured for text-only samples.", skipped)
+    if not text_only_examples:
+        raise ValueError("No text-only SFT examples remain after skipping rows with image/audio/video content.")
+    return text_only_examples
 
 
 def select_direct_hf_sft_collate(
@@ -299,7 +325,14 @@ def load_direct_hf_sft_train_examples(config: DirectHFSFTDatasetConfig) -> list[
     if len(sources) == 1 and config.source_weights is None:
         return load_direct_hf_sft_examples(sources[0], config.preprocessing)
     rows = load_and_blend_hf_datasets(sources, config.source_weights, seed=config.blend_seed)
-    return normalize_sft_examples(rows, config.preprocessing)
+    examples = normalize_sft_examples(
+        rows,
+        config.preprocessing,
+        skip_invalid_rows=any(source.skip_invalid_jsonl_rows for source in sources),
+    )
+    if any(source.skip_multimodal_rows for source in sources):
+        examples = _skip_multimodal_sft_examples(examples, config.preprocessing)
+    return examples
 
 
 def build_direct_hf_sft_split(
